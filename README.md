@@ -25,37 +25,38 @@ smart-traffic-light-controller/
 ├── data/simulation_logs/         generated run data
 ├── src/
 │   ├── simulation/                Phase 1 — traffic simulation      ✅
-│   ├── fuzzy/                     Phase 2 — fuzzy controller
+│   ├── fuzzy/                     Phase 2 — fuzzy controller        ✅
 │   ├── optimization/              Phase 3 — pso.py, aco.py
-│   └── cost_function.py           C = αW + βQ + γS
+│   └── cost_function.py           Phase 2 — C = αW + βQ + γS         ✅
 ├── experiments/                   run/test scripts
 ├── results/plots/, results/tables/  charts and comparison tables
 ├── notebooks/                     optional exploration
 └── report/                        final written report
 ```
 
-Each `src/` submodule has its own README with full details — start there for implementation specifics.
+Each `src/` submodule has its own README with full details — start there for implementation specifics. `src/fuzzy/README.md` is written specifically for whoever picks up Phase 3, describing the exact interface to call.
 
 ## Pipeline — 4 Phases
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Traffic simulation (`TrafficEnv`) — see `src/simulation/README.md` | ✅ Done |
-| 2 | Fuzzy controller (Mamdani, centroid defuzzification) | ⬜ Not started |
+| 2 | Fuzzy controller (Mamdani, centroid defuzzification) + cost function — see `src/fuzzy/README.md` | ✅ Done |
 | 3 | PSO + ACO tuning of the fuzzy controller | ⬜ Not started |
 | 4 | Comparison, analysis, report, presentation video | ⬜ Not started |
 
 ## Team Split
 
-- **Member 1:** Phase 1 (done) → Phase 2
-- **Member 2:** Phase 3 (can start once Phase 2's controller interface is fixed)
+- **Member 1:** Phase 1 (done) → Phase 2 (done)
+- **Member 2:** Phase 3 — ready to start now, interface is locked (see `src/fuzzy/README.md`)
 - **Both:** Phase 4
 
 ## Setup & Running
 
 ```bash
 pip install -r requirements.txt
-python experiments/test_traffic_env.py   # Phase 1 smoke test
+python experiments/test_traffic_env.py       # Phase 1 smoke test
+python experiments/test_fuzzy_controller.py  # Phase 2 smoke test
 ```
 
 ## Authors
