@@ -1,6 +1,4 @@
 """
-experiments/compare_optimizers.py
-
 Runs PSO (optimization/pso.py) and ACO (optimization/aco.py) against the
 same fuzzy-controller tuning problem, then:
 

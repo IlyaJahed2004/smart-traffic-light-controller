@@ -1,6 +1,4 @@
 """
-test_pso_smoke.py
-
 Quick, cheap sanity check for optimization/pso.py. Not a formal unit
 test suite -- just enough to catch integration mistakes (wrong import
 paths, broken repair logic, non-reproducible runs) before a full,

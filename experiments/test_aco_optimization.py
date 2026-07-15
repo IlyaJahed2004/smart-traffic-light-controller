@@ -1,6 +1,4 @@
 """
-test_aco_smoke.py
-
 Quick, cheap sanity check for optimization/aco.py. Mirrors
 test_pso_smoke.py so the two algorithms can be checked (and later
 compared) the same way.
