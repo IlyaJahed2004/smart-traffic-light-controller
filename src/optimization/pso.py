@@ -72,9 +72,11 @@ def make_single_scenario_fitness(
     described in the README: one env_factory, evaluated once per
     candidate.
 
-    cost_kwargs are forwarded to evaluate_controller (e.g. alpha,
-    beta, gamma, decision_interval) so cost-function weighting stays
-    configurable from the caller instead of hardcoded here.
+    cost_kwargs are forwarded to evaluate_controller (alpha, beta,
+    gamma only -- see cost_function.py). evaluate_controller now
+    always uses realistic block-based light switching internally
+    (Phase 2 fix), so there is no decision_interval or similar
+    per-tick knob to configure here anymore.
     """
 
     def fitness(controller) -> float:
