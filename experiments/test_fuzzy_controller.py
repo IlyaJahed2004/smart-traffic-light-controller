@@ -86,6 +86,10 @@ def main():
     num_steps = 2000
  
     controller = FuzzyController()
+    import pprint
+    print("Default fuzzy parameters:")
+    pprint.pprint(controller.get_default_params())
+    print()
  
     # --- Sanity checks on the parameter interface (what PSO/ACO use) ---
     vec = controller.get_default_vector()
