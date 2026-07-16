@@ -44,11 +44,11 @@ def main():
     # --- baseline cost, for comparison ---
     default_vec = controller.get_default_vector()
     controller.set_params_from_vector(default_vec)
-    baseline_cost = evaluate_controller(controller, env_factory, num_steps=300, decision_interval=5)
+    baseline_cost = evaluate_controller(controller, env_factory, num_steps=300)
     print(f"Baseline (default vector) cost: {baseline_cost:.4f}")
 
     # --- small, fast ACO run ---
-    fitness_fn = make_single_scenario_fitness(env_factory, num_steps=300, decision_interval=5)
+    fitness_fn = make_single_scenario_fitness(env_factory, num_steps=300)
     aco = ACOOptimizer(
         controller, fitness_fn,
         archive_size=15, num_ants=10, max_iter=20,

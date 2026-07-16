@@ -46,11 +46,11 @@ def main():
     # --- baseline cost, for comparison ---
     default_vec = controller.get_default_vector()
     controller.set_params_from_vector(default_vec)
-    baseline_cost = evaluate_controller(controller, env_factory, num_steps=300, decision_interval=5)
+    baseline_cost = evaluate_controller(controller, env_factory, num_steps=300)
     print(f"Baseline (default vector) cost: {baseline_cost:.4f}")
 
     # --- small, fast PSO run ---
-    fitness_fn = make_single_scenario_fitness(env_factory, num_steps=300, decision_interval=5)
+    fitness_fn = make_single_scenario_fitness(env_factory, num_steps=300)
     pso = PSOOptimizer(
         controller, fitness_fn,
         num_particles=15, max_iter=20,
@@ -62,6 +62,15 @@ def main():
     print(f"PSO best cost:                  {best_cost:.4f}")
     print(f"Improvement over baseline:       {baseline_cost - best_cost:+.4f}")
     print(f"Convergence (every 4th entry):   {[round(h, 3) for h in history[::4]]}")
+
+    # PSO's global best only ever updates on strict improvement, so
+    # the recorded history can never get worse from one iteration to
+    # the next -- same property ACO_R's elitist archive guarantees,
+    # checked here the same way for consistency between the two
+    # smoke tests.
+    monotonic = all(history[i] >= history[i + 1] - 1e-9 for i in range(len(history) - 1))
+    assert monotonic, "history is not monotonically non-increasing (global best regressed)"
+    print("Monotonic convergence OK (global best never regresses)")
 
     check_feasibility(best_position, lower, upper, "best_position")
     assert best_position.shape == (27,), "vector length must be 27"
