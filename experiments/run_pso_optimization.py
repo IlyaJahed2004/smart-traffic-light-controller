@@ -1,16 +1,29 @@
 """
 run_pso_optimization.py
 
-Quick, cheap sanity check for optimization/pso.py. Not a formal unit
-test suite -- just enough to catch integration mistakes (wrong import
-paths, broken repair logic, non-reproducible runs) before a full,
-expensive PSO run.
+Final Phase 3 run script for PSO. Unlike the earlier smoke-test
+version (which used a single fixed-seed scenario just to check the
+pipeline didn't crash), this version optimizes against a ROBUST
+fitness: the average cost across several traffic scenarios (light/
+heavy, symmetric/asymmetric), each repeated over several random
+seeds, so the tuned controller isn't just overfit to one specific
+arrival sequence.
+
+This is computationally heavy (30 particles x 12 scenario/seed
+combos x 100 iterations = ~36,000 full 1000-tick simulations), so
+this version prints progress after every iteration with a running
+ETA -- it is NOT frozen if you don't see new output for a while,
+each individual iteration just takes a while. If you want to sanity
+-check the script quickly before committing to a full run, shrink
+SEEDS to a single seed and/or PSO_KWARGS's num_particles/max_iter
+temporarily.
 
 Run from the project root:
     python experiments/run_pso_optimization.py
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
@@ -20,13 +33,58 @@ import numpy as np
 from fuzzy.fuzzy_controller import FuzzyController
 from simulation.traffic_env import TrafficEnv
 from cost_function import evaluate_controller
-from optimization.pso import PSOOptimizer, make_single_scenario_fitness
+from optimization.pso import PSOOptimizer, make_multi_scenario_fitness
+
+# Set to True to also re-run the whole optimization a second time with
+# the same seed, to verify reproducibility. Doubles total runtime --
+# off by default since it's a one-time sanity check, not something you
+# need on every run once you've confirmed it once.
+RUN_REPRODUCIBILITY_CHECK = False
+
+PSO_KWARGS = dict(
+    num_particles=30, max_iter=100,
+    w=0.7, w_min=0.4, c1=1.5, c2=1.5,
+    random_seed=7,
+)
 
 
-def make_env_factory():
-    return lambda: TrafficEnv(
-        arrival_rate_1=0.4, arrival_rate_2=0.2, departure_rate=1.0, seed=42
-    )
+# ----------------------------------------------------------------------
+# Scenario definitions
+# ----------------------------------------------------------------------
+# Same four traffic patterns used for the honest Phase 2 evaluation
+# (see src/fuzzy/README.md), each replayed with several seeds so a
+# candidate controller is scored on the traffic PATTERN, not on one
+# specific lucky/unlucky arrival sequence tied to a single seed.
+
+SCENARIOS = [
+    ("moderate symmetric",  0.3, 0.3),
+    ("moderate asymmetric", 0.4, 0.2),
+    ("heavy asymmetric",    0.6, 0.2),
+    ("heavy symmetric",     0.5, 0.5),
+]
+SEEDS = [1, 2, 3]
+NUM_STEPS = 1000
+
+
+def make_env_factory(r1, r2, seed):
+    """Returns a zero-arg callable that builds a fresh TrafficEnv.
+    Defaults on r1/r2/seed avoid the classic late-binding closure bug
+    when this is called inside a loop."""
+    def _factory(r1=r1, r2=r2, seed=seed):
+        return TrafficEnv(arrival_rate_1=r1, arrival_rate_2=r2,
+                           departure_rate=1.0, seed=seed)
+    return _factory
+
+
+def build_env_factories():
+    """Cross product of SCENARIOS x SEEDS -> list of env_factories."""
+    factories = []
+    labels = []
+    for label, r1, r2 in SCENARIOS:
+        for seed in SEEDS:
+            factories.append(make_env_factory(r1, r2, seed))
+            labels.append(f"{label} (seed={seed})")
+    return factories, labels
 
 
 def check_feasibility(position, lower, upper, label):
@@ -38,36 +96,82 @@ def check_feasibility(position, lower, upper, label):
     print(f"[{label}] OK: within bounds, all triangles valid")
 
 
+def report_per_scenario(controller, factories, labels):
+    """Print the tuned controller's cost on each individual scenario,
+    not just the aggregate -- so a low average can't hide one scenario
+    that got much worse."""
+    print("\nPer-scenario breakdown (tuned controller):")
+    for factory, label in zip(factories, labels):
+        cost = evaluate_controller(controller, factory, NUM_STEPS)
+        print(f"  {label:30s} cost={cost:8.2f}")
+
+
 def main():
+    env_factories, labels = build_env_factories()
+    print(f"Optimizing against {len(env_factories)} scenario/seed combinations "
+          f"({len(SCENARIOS)} traffic patterns x {len(SEEDS)} seeds each)\n")
+
     controller = FuzzyController()
     lower, upper = controller.get_param_bounds()
-    env_factory = make_env_factory()
 
-    # --- baseline cost, for comparison ---
+    fitness_fn = make_multi_scenario_fitness(
+        env_factories=env_factories,
+        num_steps=NUM_STEPS,
+        aggregate=np.mean,
+    )
+
+    # --- baseline: default hand-picked params, same robust fitness ---
     default_vec = controller.get_default_vector()
     controller.set_params_from_vector(default_vec)
-    baseline_cost = evaluate_controller(controller, env_factory, num_steps=300)
-    print(f"Baseline (default vector) cost: {baseline_cost:.4f}")
+    baseline_cost = fitness_fn(controller)
+    print(f"Baseline (default vector) avg cost across all scenarios: {baseline_cost:.4f}")
 
-    # --- small, fast PSO run ---
-    fitness_fn = make_single_scenario_fitness(env_factory, num_steps=300)
-    pso = PSOOptimizer(
-        controller, fitness_fn,
-        num_particles=15, max_iter=20,
-        w=0.7, w_min=0.4, c1=1.5, c2=1.5,
-        random_seed=7,
-    )
-    best_position, best_cost, history = pso.optimize()
+    # --- PSO run (manual loop instead of pso.optimize(), so we can
+    #     print progress + ETA after every iteration -- optimize()
+    #     itself is a black box that only returns once at the end) ---
+    pso = PSOOptimizer(controller, fitness_fn, **PSO_KWARGS)
 
-    print(f"PSO best cost:                  {best_cost:.4f}")
-    print(f"Improvement over baseline:       {baseline_cost - best_cost:+.4f}")
-    print(f"Convergence (every 4th entry):   {[round(h, 3) for h in history[::4]]}")
+    print(f"\nInitializing swarm ({PSO_KWARGS['num_particles']} particles, "
+          f"{len(env_factories)} scenarios each = "
+          f"{PSO_KWARGS['num_particles'] * len(env_factories)} simulations)...")
+    t_start = time.time()
+    pso._initialize_population()
+    t_init = time.time() - t_start
+    history = [pso.global_best_cost]
+    print(f"  done in {t_init:.1f}s. Initial best avg cost: {pso.global_best_cost:.4f}")
 
-    # PSO's global best only ever updates on strict improvement, so
-    # the recorded history can never get worse from one iteration to
-    # the next -- same property ACO_R's elitist archive guarantees,
-    # checked here the same way for consistency between the two
-    # smoke tests.
+    print(f"\nRunning {PSO_KWARGS['max_iter']} iterations "
+          f"({PSO_KWARGS['num_particles'] * len(env_factories)} simulations/iteration)...")
+    for it in range(PSO_KWARGS["max_iter"]):
+        t_iter_start = time.time()
+        inertia = pso._current_inertia(it)
+        for particle in pso.swarm:
+            pso._update_velocity(particle, inertia)
+            pso._update_position(particle)
+            particle.fitness = pso._evaluate(particle.position)
+            pso._update_personal_best(particle)
+            pso._update_global_best(particle)
+        history.append(pso.global_best_cost)
+
+        t_iter = time.time() - t_iter_start
+        elapsed = time.time() - t_start
+        remaining_iters = PSO_KWARGS["max_iter"] - (it + 1)
+        eta = remaining_iters * t_iter
+        print(f"  iter {it + 1:>3}/{PSO_KWARGS['max_iter']}  "
+              f"best={pso.global_best_cost:9.4f}  "
+              f"({t_iter:5.1f}s this iter, {elapsed / 60:5.1f}min elapsed, "
+              f"~{eta / 60:5.1f}min remaining)")
+
+    best_position = pso.global_best_position
+    best_cost = pso.global_best_cost
+
+    print(f"\nPSO best avg cost:                {best_cost:.4f}")
+    print(f"Improvement over baseline:        {baseline_cost - best_cost:+.4f} "
+          f"({100 * (baseline_cost - best_cost) / baseline_cost:.1f}%)")
+    print(f"Convergence (every 10th entry):   {[round(h, 3) for h in history[::10]]}")
+
+    # PSO's global best only ever updates on strict improvement, so the
+    # recorded history can never get worse from one iteration to the next.
     monotonic = all(history[i] >= history[i + 1] - 1e-9 for i in range(len(history) - 1))
     assert monotonic, "history is not monotonically non-increasing (global best regressed)"
     print("Monotonic convergence OK (global best never regresses)")
@@ -75,19 +179,27 @@ def main():
     check_feasibility(best_position, lower, upper, "best_position")
     assert best_position.shape == (27,), "vector length must be 27"
 
-    # --- reproducibility check: same seed -> identical result ---
-    pso_repeat = PSOOptimizer(
-        controller, fitness_fn,
-        num_particles=15, max_iter=20,
-        w=0.7, w_min=0.4, c1=1.5, c2=1.5,
-        random_seed=7,
-    )
-    best_position_2, best_cost_2, _ = pso_repeat.optimize()
-    assert best_cost == best_cost_2, "same seed produced different cost"
-    assert np.allclose(best_position, best_position_2), "same seed produced different position"
-    print("Reproducibility OK: identical seed -> identical result")
+    # --- reproducibility check: same seed -> identical result (optional,
+    #     off by default since it doubles total runtime -- see flag above) ---
+    if RUN_REPRODUCIBILITY_CHECK:
+        print("\nRe-running once more with the same seed to verify reproducibility "
+              "(this doubles total runtime)...")
+        controller_repeat = FuzzyController()
+        pso_repeat = PSOOptimizer(controller_repeat, fitness_fn, **PSO_KWARGS)
+        best_position_2, best_cost_2, _ = pso_repeat.optimize()
+        assert best_cost == best_cost_2, "same seed produced different cost"
+        assert np.allclose(best_position, best_position_2), "same seed produced different position"
+        print("Reproducibility OK: identical seed -> identical result")
+    else:
+        print("\n(Skipping reproducibility re-run -- set RUN_REPRODUCIBILITY_CHECK = True "
+              "to enable it.)")
 
-    print("\nAll smoke checks passed.")
+    # --- make sure the win isn't hiding a regression on one scenario ---
+    controller.set_params_from_vector(best_position)
+    report_per_scenario(controller, env_factories, labels)
+
+    print("\nAll checks passed. `best_position` is ready to be loaded as the")
+    print("final tuned controller (controller.set_params_from_vector(best_position)).")
 
 
 if __name__ == "__main__":
