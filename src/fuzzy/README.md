@@ -10,18 +10,18 @@
 This is the "brain" that looks at how many cars are waiting on each road and decides how long the green light should stay on. It uses **fuzzy logic**: instead of a hard rule like "if queue > 10, switch," it uses smooth categories — `Low`, `Medium`, `High` — so decisions don't awkwardly flip-flop right at a boundary.
 
 **Inputs:** queue length of road 1, queue length of road 2
-**Output:** green time for road 1 (in seconds). Road 2's green time is just `cycle_time - green_time_1` (clipped to valid bounds), since the project spec only defines one fuzzy output.
+**Output:** green time for road 1 (in seconds). Road 2's green time is `cycle_time - green_time_1` (clipped to valid bounds), since the project spec only defines one fuzzy output. `cycle_time` is auto-derived as `min_green_time + max_green_time` (see "cycle_time fix" below) — you don't need to set it manually.
 
 ## ⚠️ Honest evaluation: the baseline is NOT universally better than a fixed timer
 
-We tested the default (hand-picked) fuzzy controller against a naive fixed-timer baseline across several traffic scenarios. Results:
+We tested the default (hand-picked) fuzzy controller against a naive fixed-timer baseline across several traffic scenarios, using **realistic block-based light switching** (see below). Results:
 
 | Scenario | Arrival rates (r1, r2) | Fixed-timer cost | Fuzzy cost | Winner |
 |---|---|---|---|---|
-| Moderate, symmetric | (0.3, 0.3) | 63.66 | 84.29 | **Fixed-timer** |
-| Moderate, asymmetric | (0.4, 0.2) | 71.24 | 61.62 | **Fuzzy** |
-| Heavy, asymmetric | (0.6, 0.2) | 392.12 | 90.13 | **Fuzzy** (by a lot) |
-| Heavy, symmetric | (0.5, 0.5) | 192.13 | 190.82 | **Fuzzy** (barely) |
+| Moderate, symmetric | (0.3, 0.3) | 63.66 | 73.56 | **Fixed-timer** |
+| Moderate, asymmetric | (0.4, 0.2) | 71.24 | 62.56 | **Fuzzy** |
+| Heavy, asymmetric | (0.6, 0.2) | 392.12 | 82.95 | **Fuzzy** (by a lot) |
+| Heavy, symmetric | (0.5, 0.5) | 192.13 | 177.69 | **Fuzzy** (slightly) |
 
 **Takeaway:** the fuzzy controller (with default, hand-picked parameters) tends to win under **heavy and/or imbalanced traffic** — exactly where an adaptive controller should help, since a fixed-timer wastes green time on an empty/light road. But under **light, balanced traffic**, it can actually be worse than simple alternation.
 
@@ -54,7 +54,7 @@ from simulation.traffic_env import TrafficEnv
 
 env_factory = lambda: TrafficEnv(arrival_rate_1=0.4, arrival_rate_2=0.2,
                                    departure_rate=1.0, seed=42)
-cost = evaluate_controller(controller, env_factory, num_steps=2000, decision_interval=1)
+cost = evaluate_controller(controller, env_factory, num_steps=2000)
 
 # 5. Your algorithm wants to MINIMIZE `cost`. That's it.
 ```
@@ -72,11 +72,17 @@ You don't need to know this to write PSO/ACO — `get_param_bounds()` and `set_p
 
 This matches the spec exactly: *"position of each particle contains membership function parameters and fuzzy rule weights."*
 
-### Important: `decision_interval`
+**Important:** `min_green_time`, `max_green_time`, and `cycle_time` are **NOT** part of the 27-number vector — PSO/ACO cannot change them, they're fixed constants set once when the `FuzzyController` is constructed. The 27 numbers are always bounded within whatever those constants are set to.
 
-`evaluate_controller(..., decision_interval=N)` controls how often (in ticks) the controller is allowed to re-decide which road is green.
-- `decision_interval=1` — re-decide every tick. This is what all testing above uses, and is confirmed to work correctly.
-- Larger values (e.g. 10) are more physically realistic (real lights don't flip every second) but require well-tuned membership functions to avoid starving one road — worth testing carefully if you use this.
+### How the light actually switches (realistic block-based timing)
+
+`evaluate_controller()` no longer flip-flops the light every tick. Instead, it takes `compute_green_time()`'s output literally:
+1. Controller computes a plan, e.g. `green_1=40s, green_2=10s`
+2. Road 1 stays green for a solid block of ~40 ticks
+3. Road 2 stays green for a solid block of ~10 ticks
+4. Only then does it ask the controller again, using the now-updated queue lengths
+
+This matches how a real traffic light cycle works. (An earlier version re-asked every tick and just used `green_1 >= green_2` as a per-tick tie-break, causing unrealistic flickering — up to 13 switches in 40 ticks. That version is deprecated.)
 
 ## How it works internally (optional reading)
 
@@ -91,7 +97,7 @@ This is the full classic Mamdani pipeline (clip → aggregate → centroid), mat
 
 | Method | What it does, simply |
 |---|---|
-| `compute_green_time(q1, q2)` | The main decision function: give it two queue lengths, get back `(green_1, green_2)` in seconds. |
+| `compute_green_time(q1, q2)` | The main decision function: give it two queue lengths, get back `(green_1, green_2)` in seconds. Always sums to `cycle_time`. |
 | `get_default_params()` | The hand-designed starting parameters, as a readable nested dict. |
 | `get_default_vector()` | Same thing, flattened into the 27-number array PSO/ACO use. |
 | `get_param_bounds()` | The valid min/max range for each of the 27 numbers. |
@@ -101,17 +107,25 @@ This is the full classic Mamdani pipeline (clip → aggregate → centroid), mat
 ## `cost_function.py`
 
 - `compute_cost(metrics, alpha, beta, gamma)` — plugs `TrafficEnv.get_metrics()` output into `C = α·W + β·Q + γ·S`.
-- `evaluate_controller(controller, env_factory, num_steps, ...)` — the all-in-one function: runs a full simulation with a given controller and returns its cost. **This is the function PSO/ACO will call once per candidate.**
+- `evaluate_controller(controller, env_factory, num_steps, ...)` — the all-in-one function: runs a full simulation with a given controller (using realistic block-based switching, see above) and returns its cost. **This is the function PSO/ACO will call once per candidate.**
 - Default weights: `alpha=1.0, beta=1.0, gamma=0.1` (gamma is smaller because `num_stops` tends to be a much bigger raw number than W or Q — adjust these together during Phase 4 experiments).
 
-## Bug fixed during testing
+## Bugs found and fixed during testing
 
-We found and fixed a boundary bug in the triangular membership function: extreme queue values (exactly 0 or exactly the max) were incorrectly fuzzified as belonging to *no* category, causing no rules to fire and the controller to silently default to an equal 25/25 green-time split — even when one road was completely empty. This has been fixed (see git history / commit messages for `fuzzy_controller.py`) and verified with targeted tests.
+**1. Membership function boundary bug.** Extreme queue values (exactly 0 or exactly the max) were incorrectly fuzzified as belonging to *no* category, causing no rules to fire and the controller to silently default to an equal 25/25 green-time split — even when one road was completely empty. Fixed by correcting the boundary condition for "shoulder" shaped membership functions.
+
+**2. Unrealistic light flickering.** The simulation loop re-asked the controller every single tick and only used the comparison to pick a winner for that one tick, discarding the actual computed durations. This caused the light to flip back and forth unrealistically. Fixed by making `evaluate_controller()` honor the actual computed durations, holding each road green for its full computed block.
+
+**3. `cycle_time` / bounds inconsistency risk.** `cycle_time` was previously an independent hardcoded constant (`50`), unrelated to `min_green_time`/`max_green_time` (`5`/`45`). If those bounds were ever changed without also updating `cycle_time`, the invariant `green_1 + green_2 == cycle_time` could silently break (e.g. `48 + 5 = 53 ≠ 50`) due to the safety clip on `green_2`. Fixed by deriving `cycle_time = min_green_time + max_green_time` automatically by default, guaranteeing the invariant always holds. Default behavior is unchanged (`5 + 45` still equals `50`); this only protects against future misconfiguration.
+
+All three fixes are backward-compatible — nothing about the documented PSO/ACO interface (`get_param_bounds`, `get_default_vector`, `set_params_from_vector`, `compute_green_time`) changed.
 
 ## Testing done
 
 - Parameter vector round-trips exactly (`vector → params → vector` gives identical numbers).
 - `compute_green_time` behaves sensibly at both normal and boundary queue values, giving more green time to whichever road has the longer queue.
+- `green_1 + green_2` always exactly equals `cycle_time`, verified including edge cases with modified bounds.
+- Realistic switching verified: light holds each road green for a solid block matching the computed duration, not flickering every tick.
 - Full pipeline (`FuzzyController` → `TrafficEnv` → `cost_function`) runs end-to-end without errors.
 - **Multi-scenario comparison against the Phase 1 fixed-timer baseline** — see table above. Results are mixed and honestly reported, not cherry-picked.
 

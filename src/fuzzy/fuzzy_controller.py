@@ -82,7 +82,7 @@ class FuzzyController:
         max_queue_for_scaling=20,
         min_green_time=5,
         max_green_time=45,
-        cycle_time=50,
+        cycle_time=None,
         defuzz_resolution=101,
         params=None,
     ):
@@ -94,10 +94,29 @@ class FuzzyController:
             functions. Used only to set sensible default MF ranges.
         min_green_time, max_green_time : int
             Bounds (in seconds) for the output universe of discourse.
-        cycle_time : int
-            Fixed total green time budget per full cycle (road 1 + road 2).
+            Also define the valid range PSO/ACO can search within for
+            the green-time membership function parameters (see
+            `get_param_bounds`).
+        cycle_time : int or None
+            Fixed total green time budget per full cycle (road 1 + road 2):
             green_time_2 = cycle_time - green_time_1 (clipped to
             [min_green_time, max_green_time]).
+
+            IMPORTANT: defaults to None, which means it is AUTOMATICALLY
+            SET to `min_green_time + max_green_time`. Do not override this
+            with an unrelated fixed number -- doing so can silently break
+            the invariant `green_1 + green_2 == cycle_time`.
+
+            Concrete example of the bug this avoids: if someone sets
+            max_green_time=48 while leaving a hardcoded cycle_time=50,
+            a legitimately-computed green_1=48 would force
+            green_2 = cycle_time - green_1 = 2, which then gets clipped
+            UP to min_green_time=5 (since 2 < 5), making the true sum
+            48 + 5 = 53 instead of 50 -- silently, with no error. Deriving
+            cycle_time from the bounds instead guarantees this can never
+            happen: if green_1 is within [min_green_time, max_green_time],
+            then cycle_time - green_1 is ALWAYS also within that same
+            range, so the second clip never needs to change anything.
         defuzz_resolution : int
             Number of sample points used when discretizing the output
             universe for centroid defuzzification. Higher = more precise,
@@ -110,7 +129,10 @@ class FuzzyController:
         self.max_queue_for_scaling = max_queue_for_scaling
         self.min_green_time = min_green_time
         self.max_green_time = max_green_time
-        self.cycle_time = cycle_time
+        self.cycle_time = (
+            cycle_time if cycle_time is not None
+            else min_green_time + max_green_time
+        )
         self.defuzz_resolution = defuzz_resolution
 
         self.params = params if params is not None else self.get_default_params()

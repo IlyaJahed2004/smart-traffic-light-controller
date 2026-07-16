@@ -43,6 +43,8 @@ Per the project spec, we defined:
 
 **What about road 2's green time?** The spec only defines *one* fuzzy output (road 1's green time). So we derive road 2's green time as: `cycle_time - green_time_1` (with safe min/max limits). This keeps the total green time per cycle roughly constant, which is realistic — think of it as a shared "budget" of green time split between the two roads.
 
+`cycle_time` is a separate constant from the membership function bounds — see Step 10c for an important subtlety about how it's set.
+
 ---
 
 ## Step 4: How a category like "High" is defined mathematically
@@ -64,7 +66,7 @@ membership
 
 Three numbers `(a, b, c)` fully describe one category's shape. This is what makes the whole system **tunable** — change `a`, `b`, `c` and you change what counts as "High."
 
-**Edge case worth knowing:** when `a == b` (e.g. `Low = (0, 0, 7)`) or `b == c` (e.g. `High = (13, 20, 20)`), the shape isn't a full triangle but a "shoulder" — it's already at its peak (1.0) right at the edge of the input range, and only slopes down on one side. This is intentional and common at the boundaries, but it needs careful handling in code (see Step 10).
+**Edge case worth knowing:** when `a == b` (e.g. `Low = (0, 0, 7)`) or `b == c` (e.g. `High = (13, 20, 20)`), the shape isn't a full triangle but a "shoulder" — it's already at its peak (1.0) right at the edge of the input range, and only slopes down on one side. This is intentional and common at the boundaries, but it needs careful handling in code (see Step 10a).
 
 ---
 
@@ -124,6 +126,8 @@ This single list of 27 numbers is exactly what PSO calls a "particle position" a
 
 We also provide the valid **minimum/maximum bounds** for each of the 27 numbers, so PSO/ACO know what range to search in.
 
+**Important:** `min_green_time`, `max_green_time`, and `cycle_time` are separate fixed constants, not part of the 27-number vector. PSO/ACO can never make the controller propose a green time outside `[min_green_time, max_green_time]` — the search space itself has that ceiling and floor built in.
+
 ---
 
 ## Step 9: The cost function — what PSO/ACO are trying to minimize
@@ -142,7 +146,7 @@ We wrote `cost_function.py` with:
 
 ---
 
-## Step 10: Testing what we built (including a real bug we found and fixed)
+## Step 10: Testing what we built (including three real bugs we found and fixed)
 
 We tested (see `experiments/test_fuzzy_controller.py`):
 1. **Round-trip check** — converting the 27-number list to rules/shapes and back gives identical numbers (no data lost).
@@ -150,7 +154,7 @@ We tested (see `experiments/test_fuzzy_controller.py`):
 3. **Full pipeline works** — ran the fuzzy controller inside the actual traffic simulation from Phase 1, end-to-end, without errors.
 4. **Compared against Phase 1's baseline, across multiple traffic scenarios** — not just one.
 
-### A real bug we found and FIXED (not kept)
+### Step 10a: Membership function boundary bug (found and FIXED)
 
 While printing sample decisions, we noticed something wrong: an empty road (`queue=0`) paired with a completely full road (`queue=20`) was still getting an even 25/25 green-time split — as if the controller couldn't tell the two roads apart at all.
 
@@ -158,16 +162,34 @@ While printing sample decisions, we noticed something wrong: an empty road (`que
 
 **Fix:** corrected the boundary logic so a shoulder's peak edge correctly returns 1.0. Verified with targeted tests (`fuzzify(20)` and `fuzzify(0)` now correctly return "fully High" / "fully Low").
 
-### Honest evaluation after the fix
+### Step 10b: Unrealistic light flickering (found and FIXED)
 
-After fixing the bug, we compared the fuzzy controller against the fixed-timer baseline across **four traffic scenarios**, not just one:
+After fixing 10a, we asked: does the simulated light actually behave like a real traffic light? We checked by printing the tick-by-tick sequence of which road was green, and found the light was flipping back and forth constantly — up to 13 switches in just 40 ticks, sometimes flipping every single tick.
+
+**Root cause:** the simulation loop was asking the fuzzy controller for a fresh plan *every single tick*, then throwing away the actual computed durations (`green_1`, `green_2` in seconds) and only using the comparison `green_1 >= green_2` to pick one winner for that one tick. It never actually let a road stay green for the number of seconds the controller had calculated.
+
+**Fix:** `evaluate_controller()` now honors the computed plan literally: if the controller says `green_1=40s, green_2=10s`, the simulation holds road 1 green for a solid block of ~40 ticks, then road 2 for ~10 ticks, and only *then* asks the controller for a fresh plan (using the now-updated queue lengths). Verified: the same scenario that produced 13 flips in 40 ticks now produces only 3 switches in 100 ticks, each a clean, deliberate switch rather than flicker.
+
+### Step 10c: `cycle_time` / bounds inconsistency risk (found and FIXED)
+
+While discussing how `cycle_time` relates to `min_green_time`/`max_green_time`, we found a subtle risk: `cycle_time` was a hardcoded constant (`50`), set completely independently of `min_green_time`/`max_green_time` (`5`/`45`).
+
+**The risk, with a concrete example:** suppose someone later widens `max_green_time` to `48` (to allow longer green phases for very heavy traffic) but leaves `cycle_time=50` untouched. If the controller legitimately computes `green_1=48` (a valid value now, within the new bounds), then `green_2 = cycle_time - green_1 = 50 - 48 = 2`. Since `2` is below `min_green_time=5`, the safety clip forces `green_2` back up to `5`. The result: `green_1 + green_2 = 48 + 5 = 53`, silently **not** equal to `cycle_time=50` anymore — the "shared budget" promise breaks without any error or warning.
+
+**Important clarification:** PSO/ACO themselves can *never* trigger this, since `min_green_time`/`max_green_time`/`cycle_time` are not part of the 27-number vector they search over (see Step 8). This risk only applies to *manual* reconfiguration (e.g. during Phase 3/4 experimentation with different bound settings).
+
+**Fix:** `cycle_time` now defaults to `None`, which auto-computes as `min_green_time + max_green_time`. This makes `green_1 + green_2 == cycle_time` mathematically guaranteed rather than coincidentally true. Default behavior is completely unchanged (`5 + 45` still equals `50`); this only protects against future misconfiguration.
+
+### Honest evaluation after all fixes
+
+After all three fixes, we compared the fuzzy controller against the fixed-timer baseline across **four traffic scenarios**, not just one, using the corrected realistic block-based switching:
 
 | Scenario | Fixed-timer cost | Fuzzy cost | Winner |
 |---|---|---|---|
-| Moderate, symmetric traffic | 63.66 | 84.29 | Fixed-timer |
-| Moderate, asymmetric traffic | 71.24 | 61.62 | Fuzzy |
-| Heavy, asymmetric traffic | 392.12 | 90.13 | Fuzzy (by a lot) |
-| Heavy, symmetric traffic | 192.13 | 190.82 | Fuzzy (barely) |
+| Moderate, symmetric traffic | 63.66 | 73.56 | Fixed-timer |
+| Moderate, asymmetric traffic | 71.24 | 62.56 | Fuzzy |
+| Heavy, asymmetric traffic | 392.12 | 82.95 | Fuzzy (by a lot) |
+| Heavy, symmetric traffic | 192.13 | 177.69 | Fuzzy (slightly) |
 
 **This is not a clean win for fuzzy, and we're reporting that honestly.** The fuzzy controller (with default, hand-picked parameters) tends to win under heavy and/or imbalanced traffic — exactly where an adaptive controller should help — but can lose under light, balanced traffic. This is a legitimate, useful baseline result: it shows the default parameters aren't robust across conditions, which is **exactly the problem Phase 3 (PSO/ACO) exists to solve**.
 
@@ -184,7 +206,7 @@ controller.set_params_from_vector(candidate)          # try a candidate solution
 cost = evaluate_controller(controller, env_factory, num_steps)   # get its score (minimize this)
 ```
 
-That's the entire interface. Everything about triangles, rules, and centroids is hidden behind it.
+That's the entire interface. Everything about triangles, rules, centroids, light switching, and cycle timing is hidden behind it. None of the three bug fixes above changed this interface — they only made the internals more correct.
 
 **One suggestion for Phase 3:** since the default baseline isn't robust across traffic conditions, consider evaluating each candidate solution across *multiple* traffic scenarios (not just one `env_factory`) so PSO/ACO find parameters that generalize well, rather than overfitting to a single scenario. Worth a quick team discussion before locking in the Phase 3 evaluation strategy.
 
@@ -195,7 +217,7 @@ That's the entire interface. Everything about triangles, rules, and centroids is
 | File | Purpose |
 |---|---|
 | `src/fuzzy/fuzzy_controller.py` | The `FuzzyController` class — fuzzify, evaluate rules, defuzzify, plus the vector interface for PSO/ACO |
-| `src/cost_function.py` | Turns simulation metrics into the single cost number `C = α·W + β·Q + γ·S` |
-| `experiments/test_fuzzy_controller.py` | Smoke test: sample decisions, full pipeline check, and multi-scenario comparison against the Phase 1 baseline |
+| `src/cost_function.py` | Turns simulation metrics into the single cost number `C = α·W + β·Q + γ·S`, and runs the realistic block-based simulation loop |
+| `experiments/test_fuzzy_controller.py` | Smoke test: sample decisions, realistic switching check, full pipeline check, and multi-scenario comparison against the Phase 1 baseline |
 | `src/fuzzy/README.md` | Technical reference doc for Phase 3, focused on the handoff interface and the honest evaluation table |
 | `src/fuzzy/PHASE2_OVERVIEW.md` | This document — the step-by-step narrative of how and why Phase 2 was built |
