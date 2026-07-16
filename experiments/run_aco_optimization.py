@@ -1,12 +1,12 @@
 """
-test_aco_smoke.py
+run_aco_optimization.py
 
 Quick, cheap sanity check for optimization/aco.py. Mirrors
 test_pso_smoke.py so the two algorithms can be checked (and later
 compared) the same way.
 
 Run from the project root:
-    python test_aco_smoke.py
+    python experiments/run_aco_optimization.py
 """
 
 import sys
