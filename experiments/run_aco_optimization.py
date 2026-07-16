@@ -1,23 +1,32 @@
 """
 run_aco_optimization.py
 
-Final Phase 3 run script for ACO_R. Mirrors run_pso_optimization.py
-exactly in setup (same scenarios, same seeds, same fitness function)
-so PSO and ACO results are directly comparable in Phase 4 -- neither
-algorithm gets an easier or different evaluation.
+Final Phase 3 run script for the discretized Ant System ACO
+(see optimization/aco.py's module docstring for why it's discretized,
+and how archive_size/q/xi were re-purposed from the old ACO_R version).
 
-Like run_pso_optimization.py, this drives ACOOptimizer with a manual
-loop instead of calling aco.optimize() directly, purely so we can
-print progress + a running ETA after every iteration -- optimize()
-itself is a black box that only returns once at the very end, which
-is fine for a smoke test but not for a run heavy enough to take
-minutes (30 archive members/particles-equivalent x 12 scenario/seed
-combos x 100 iterations = thousands of full 1000-tick simulations).
-It is NOT frozen if you don't see new output for a while, each
-individual iteration just takes a while. If you want to sanity-check
-the script quickly before committing to a full run, shrink SEEDS to
-a single seed and/or ACO_KWARGS's archive_size/num_ants/max_iter
-temporarily.
+Mirrors run_pso_optimization.py in setup (same scenarios, same seeds,
+same fitness function) so PSO and ACO results are directly comparable
+in Phase 4 -- neither algorithm gets an easier or different evaluation.
+
+IMPORTANT -- updated for the new aco.py internals:
+This version no longer calls `aco._initialize_archive()` or reads
+`aco.archive_positions` / `aco.archive_fitness` -- those belonged to
+the old ACO_R implementation and no longer exist. The new
+ACOOptimizer keeps its own running best as `aco.best_position` /
+`aco.best_cost`, updated via `_update_global_best()`, and its
+"pheromone update" (evaporation + deposit) via `_update_pheromone()`
+-- called in that order, exactly matching the class's own
+`optimize()` method internals. This script reproduces that same
+sequence manually purely to print progress + ETA after every
+iteration, since `optimize()` itself is a black box that only
+returns once at the very end.
+
+Like run_pso_optimization.py, it is NOT frozen if you don't see new
+output for a while -- each individual iteration just takes a while.
+If you want to sanity-check the script quickly before committing to
+a full run, shrink SEEDS to a single seed and/or ACO_KWARGS's
+archive_size/num_ants/max_iter temporarily.
 
 Run from the project root:
     python experiments/run_aco_optimization.py
@@ -44,8 +53,26 @@ from optimization.aco import ACOOptimizer, make_multi_scenario_fitness
 RUN_REPRODUCIBILITY_CHECK = False
 
 ACO_KWARGS = dict(
-    archive_size=30, num_ants=15, max_iter=100,
-    q=0.3, xi=0.85,
+    archive_size=30,   # size of the initial random priming batch (not a
+                        # persistent archive anymore -- see aco.py docstring)
+    num_ants=15,        # ants constructed per iteration
+    max_iter=100,
+    q=0.3,              # re-purposed: Ant-System deposit constant Q
+                        # (Delta_tau = Q / cost), NOT the old ACO_R
+                        # locality parameter
+    xi=0.85,            # re-purposed: pheromone evaporation rate rho
+                        # in [0.01, 0.99], NOT the old ACO_R spread decay
+    num_bins=20,        # discretization resolution per dimension
+    alpha=1.0,          # pheromone-influence exponent (selection prob ~ tau**alpha)
+    tau0=1.0,           # initial pheromone value in every cell
+    tau_min=1e-3,       # pheromone floor -- keeps exploration alive (Max-Min style)
+    elitist_weight=2.0, # extra deposit multiplier for the global-best solution
+    # Unlike PSO (where this GUARANTEES one particle starts exactly at
+    # the default vector), this only pre-boosts the pheromone near the
+    # default vector's nearest bins -- a soft bias, not a guarantee the
+    # default vector is ever actually sampled. Default for this class
+    # is False; turned on here for rough parity with PSO's behavior.
+    seed_with_default_vector=True,
     random_seed=7,
 )
 
@@ -126,58 +153,70 @@ def main():
 
     # --- ACO run (manual loop instead of aco.optimize(), so we can
     #     print progress + ETA after every iteration -- optimize()
-    #     itself is a black box that only returns once at the end) ---
+    #     itself is a black box that only returns once at the end).
+    #     This reproduces optimize()'s exact sequence: construct ants,
+    #     update global best, THEN update pheromone (evaporate+deposit),
+    #     in that order, both for the initial priming batch and every
+    #     subsequent iteration. ---
     aco = ACOOptimizer(controller, fitness_fn, **ACO_KWARGS)
 
-    sims_per_archive_member = len(env_factories)
-    init_sims = ACO_KWARGS["archive_size"] * sims_per_archive_member
-    iter_sims = ACO_KWARGS["num_ants"] * sims_per_archive_member
+    sims_per_ant = len(env_factories)
+    init_sims = ACO_KWARGS["archive_size"] * sims_per_ant
+    iter_sims = ACO_KWARGS["num_ants"] * sims_per_ant
 
-    print(f"\nInitializing archive ({ACO_KWARGS['archive_size']} members, "
+    print(f"\nPriming pheromone table ({ACO_KWARGS['archive_size']} random ants, "
           f"{len(env_factories)} scenarios each = {init_sims} simulations)...")
     t_start = time.time()
-    aco._initialize_archive()
+    init_ants = [aco._construct_ant() for _ in range(aco.init_batch)]
+    aco._update_global_best(init_ants)
+    aco._update_pheromone(init_ants)
     t_init = time.time() - t_start
-    history = [float(aco.archive_fitness[0])]
-    print(f"  done in {t_init:.1f}s. Initial best avg cost: {aco.archive_fitness[0]:.4f}")
+    history = [aco.best_cost]
+    print(f"  done in {t_init:.1f}s. Initial best avg cost: {aco.best_cost:.4f}")
 
     print(f"\nRunning {ACO_KWARGS['max_iter']} iterations "
           f"({ACO_KWARGS['num_ants']} ants x {len(env_factories)} scenarios = "
           f"{iter_sims} simulations/iteration)...")
     for it in range(ACO_KWARGS["max_iter"]):
         t_iter_start = time.time()
-        new_ants = [aco._construct_ant() for _ in range(aco.num_ants)]
-        aco._update_archive(new_ants)
-        history.append(float(aco.archive_fitness[0]))
+        ants = [aco._construct_ant() for _ in range(aco.num_ants)]
+        aco._update_global_best(ants)
+        aco._update_pheromone(ants)
+        history.append(aco.best_cost)
 
         t_iter = time.time() - t_iter_start
         elapsed = time.time() - t_start
         remaining_iters = ACO_KWARGS["max_iter"] - (it + 1)
         eta = remaining_iters * t_iter
         print(f"  iter {it + 1:>3}/{ACO_KWARGS['max_iter']}  "
-              f"best={aco.archive_fitness[0]:9.4f}  "
+              f"best={aco.best_cost:9.4f}  "
               f"({t_iter:5.1f}s this iter, {elapsed / 60:5.1f}min elapsed, "
               f"~{eta / 60:5.1f}min remaining)")
 
-    best_position = aco.archive_positions[0].copy()
-    best_cost = float(aco.archive_fitness[0])
+    best_position = aco.best_position.copy()
+    best_cost = aco.best_cost
 
     print(f"\nACO best avg cost:                {best_cost:.4f}")
     print(f"Improvement over baseline:        {baseline_cost - best_cost:+.4f} "
           f"({100 * (baseline_cost - best_cost) / baseline_cost:.1f}%)")
     print(f"Convergence (every 10th entry):   {[round(h, 3) for h in history[::10]]}")
 
-    # ACO_R is elitist by construction: the archive's best member can
-    # only stay the same or improve each iteration, never regress.
+    # best_cost is tracked separately from the pheromone table (which
+    # keeps evaporating/being reinforced), and only ever updated on
+    # strict improvement in _update_global_best -- so it can never
+    # regress, the same guarantee PSO's global best has.
     monotonic = all(history[i] >= history[i + 1] - 1e-9 for i in range(len(history) - 1))
-    assert monotonic, "history is not monotonically non-increasing (elitism broken)"
-    print("Monotonic convergence OK (elitist archive never regresses)")
+    assert monotonic, "history is not monotonically non-increasing (global best regressed)"
+    print("Monotonic convergence OK (global best never regresses)")
 
     check_feasibility(best_position, lower, upper, "best_position")
     assert best_position.shape == (27,), "vector length must be 27"
 
     # --- reproducibility check: same seed -> identical result (optional,
-    #     off by default since it doubles total runtime -- see flag above) ---
+    #     off by default since it doubles total runtime -- see flag above).
+    #     Uses the class's own optimize() end-to-end, since that's still
+    #     the public black-box contract and is unaffected by the manual
+    #     -loop reproduction above. ---
     if RUN_REPRODUCIBILITY_CHECK:
         print("\nRe-running once more with the same seed to verify reproducibility "
               "(this doubles total runtime)...")
