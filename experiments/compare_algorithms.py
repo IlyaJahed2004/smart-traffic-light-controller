@@ -183,7 +183,6 @@ def main() -> None:
 
     # Simulation / cost
     parser.add_argument("--num-steps", type=int, default=500)
-    parser.add_argument("--decision-interval", type=int, default=5)
     parser.add_argument("--arrival-rate-1", type=float, default=0.4)
     parser.add_argument("--arrival-rate-2", type=float, default=0.2)
     parser.add_argument("--departure-rate", type=float, default=1.0)
@@ -227,12 +226,12 @@ def main() -> None:
     controller.set_params_from_vector(default_vec)
     baseline_cost = evaluate_controller(
         controller, env_factory,
-        num_steps=args.num_steps, decision_interval=args.decision_interval,
+        num_steps=args.num_steps,
     )
     print(f"Baseline (default vector) cost: {baseline_cost:.4f}")
 
     fitness_fn = make_single_scenario_fitness(
-        env_factory, num_steps=args.num_steps, decision_interval=args.decision_interval,
+        env_factory, num_steps=args.num_steps,
     )
 
     # --- PSO ---

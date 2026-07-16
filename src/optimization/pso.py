@@ -154,7 +154,7 @@ class PSOOptimizer:
         w_min: Optional[float] = None,
         v_max_fraction: float = 0.2,
         random_seed: Optional[int] = None,
-        seed_with_default_vector: bool = True,
+        seed_with_default_vector: bool = False,
     ) -> None:
         """
         Parameters

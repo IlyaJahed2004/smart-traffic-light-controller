@@ -2,29 +2,34 @@
 optimization/aco.py
 
 Phase 3: Ant Colony Optimization for tuning the FuzzyController's
-27-parameter vector, using ACO_R (Ant Colony Optimization for
-continuous domains -- Socha & Dorigo, 2008).
+27-parameter vector, using DISCRETIZED "classic" Ant System ACO
+(Dorigo, 1992) rather than ACO_R.
 
-Why ACO_R and not "classic" graph/pheromone-trail ACO
-------------------------------------------------------
-Classic ACO is defined over discrete choices (edges in a graph).
+Why discretization is necessary
+--------------------------------
+Classic ACO is defined over discrete choices (edges in a graph):
+a finite set of options at each step, a real pheromone value per
+option, probabilistic selection weighted by pheromone, and
+evaporation + deposit as the update rule (Delta_tau_k = Q / cost_k,
+deposited on the edges ant k used -- exactly Dorigo's original Ant
+System formula).
+
 Our search space is a continuous 27-dimensional real vector, so
-there is no natural graph to lay pheromone on. ACO_R adapts the same
-core idea -- solutions influence where future ants search, weighted
-by quality -- to continuous variables:
+there is no native graph to run that algorithm on. This module
+manufactures one: each of the 27 dimensions is sliced into
+`num_bins` evenly-spaced discrete levels between its lower and upper
+bound, so "build a solution" becomes "for each dimension, pick one
+of num_bins levels" -- a genuine discrete choice, with a genuine
+pheromone table tau[dim, bin] and genuine evaporation/deposit. This
+is the standard way "real" ACO is forced onto continuous domains
+(as opposed to ACO_R, which sidesteps discretization entirely with
+a Gaussian-kernel archive -- see git history for that version).
 
-  - Instead of a pheromone table, we keep an ARCHIVE of the best K
-    solutions found so far, sorted by fitness (best first).
-  - Each archive member acts as the center of a Gaussian "pheromone
-    kernel". Better-ranked solutions get a higher probability of
-    being chosen as a kernel (via Gaussian-weighted ranks).
-  - Each new ant builds a solution dimension-by-dimension: for each
-    dimension, pick a kernel (weighted by rank) and sample a Gaussian
-    centered on that kernel's value, with a spread proportional to
-    how spread out the archive already is in that dimension.
-  - New ants are merged into the archive, and only the best K
-    solutions survive (elitist truncation) -- this is the "pheromone
-    update" step.
+Trade-off vs ACO_R: parameters snap to bin centers instead of
+varying continuously, so resolution is capped by `num_bins`. For a
+smooth numeric landscape like this one, ACO_R is expected to
+out-perform this version -- that's *why* ACO_R exists -- but this
+is the "textbook" pheromone-trail algorithm, faithfully applied.
 
 Like pso.py, this module treats the fuzzy controller and simulation
 as black boxes and only calls:
@@ -46,15 +51,43 @@ FuzzyController.params_to_vector for the authoritative version):
     [15:18] mf_green "Long"   (a, b, c)
     [18:27] rule_weights[0..8]
 
-As in pso.py: within each (a, b, c) triangle the lower/upper bounds
-are identical across a, b, and c, so clip-then-sort is a safe,
-bound-preserving repair.
+As before: within each (a, b, c) triangle the lower/upper bounds are
+identical across a, b, and c, so all three dimensions of a triangle
+share the same bin grid. That means clip-then-sort is still a safe,
+bound-preserving repair after bins are decoded to values -- sorting
+only reorders values drawn from the same shared grid.
 ------------------------------------------------------------------
+
+Parameter-name mapping from the old ACO_R constructor
+-------------------------------------------------------
+compare_algorithms.py (and anything else already wired up) calls
+this class with archive_size / num_ants / max_iter / q / xi /
+random_seed. To stay a drop-in replacement, those names are kept
+and re-purposed as follows:
+
+    archive_size -> size of the initial random-sampling batch used
+                     to "prime" the pheromone table before the main
+                     loop starts (ACO_R used this as archive K; here
+                     there is no archive, so it becomes an init
+                     batch size instead).
+    num_ants     -> ants constructed per iteration (same meaning as
+                     before).
+    max_iter     -> number of iterations (same meaning as before).
+    q            -> reused as the Ant-System deposit constant Q in
+                     Delta_tau = Q / cost (was ACO_R's locality
+                     parameter -- different role, same name).
+    xi           -> reused as the pheromone evaporation rate rho,
+                     clipped to (0.01, 0.99) (was ACO_R's spread
+                     decay parameter -- different role, same name).
+
+New, ACO-specific knobs (num_bins, alpha, tau0, tau_min,
+elitist_weight) are exposed as extra keyword arguments with sensible
+defaults, so existing call sites don't need to change at all.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -68,19 +101,26 @@ from optimization.pso import FitnessFn, make_single_scenario_fitness, make_multi
 _TRIANGLE_BLOCK_END = 18
 _TRIANGLE_WIDTH = 3
 
+# Numerical floor to avoid dividing by zero when a candidate scores
+# a cost of exactly 0.0 (deposit would otherwise be infinite).
+_COST_EPS = 1e-9
+
 
 @dataclass
 class Ant:
-    """One constructed candidate solution."""
+    """One constructed candidate solution, plus the bin index it used
+    in every dimension (needed so pheromone deposit knows which table
+    cells to reinforce)."""
 
     position: np.ndarray
+    bin_indices: np.ndarray  # shape (dim,), dtype int
     fitness: float = np.inf
 
 
 class ACOOptimizer:
     """
-    ACO_R: Ant Colony Optimization for continuous domains, applied to
-    the FuzzyController's flat parameter vector.
+    Discretized Ant System: classic pheromone-trail ACO applied to a
+    binned version of the FuzzyController's flat parameter vector.
 
     Usage
     -----
@@ -106,7 +146,12 @@ class ACOOptimizer:
         q: float = 0.3,
         xi: float = 0.85,
         random_seed: Optional[int] = None,
-        seed_with_default_vector: bool = True,
+        seed_with_default_vector: bool = False,
+        num_bins: int = 20,
+        alpha: float = 1.0,
+        tau0: float = 1.0,
+        tau_min: float = 1e-3,
+        elitist_weight: float = 2.0,
     ) -> None:
         """
         Parameters
@@ -120,41 +165,69 @@ class ACOOptimizer:
             make_single_scenario_fitness / make_multi_scenario_fitness
             in pso.py.
         archive_size : int
-            Number of solutions (K) kept in the archive -- the ACO_R
-            analogue of PSO's swarm size / pheromone memory.
+            Size of the initial random-sampling batch used to prime
+            the pheromone table before the main loop (see module
+            docstring's parameter-mapping note).
         num_ants : int
             Number of new solutions constructed per iteration.
         max_iter : int
-            Number of iterations (construct -> evaluate -> merge ->
-            truncate cycles).
+            Number of iterations (construct -> evaluate -> update
+            pheromone cycles).
         q : float
-            Locality parameter. Small q concentrates selection
-            probability on the best-ranked archive solutions
-            (exploitation); larger q spreads it more evenly across the
-            whole archive (exploration).
+            Ant-System deposit constant Q, used as
+            Delta_tau = Q / cost for every ant (see module docstring's
+            parameter-mapping note).
         xi : float
-            Convergence-speed parameter. Larger xi shrinks the Gaussian
-            sampling spread faster as the archive converges, similar in
-            spirit to PSO's inertia decay.
+            Reused as the pheromone evaporation rate rho in
+            [0.01, 0.99] (see module docstring's parameter-mapping
+            note). Higher = faster forgetting of old pheromone,
+            faster convergence, more risk of premature convergence.
         random_seed : int or None
             Seed for the colony's own RNG, for reproducible runs.
         seed_with_default_vector : bool
-            If True, one archive slot is initialized exactly at
-            controller.get_default_vector() instead of a fully random
-            position.
+            If True, the pheromone table is pre-boosted at the bin
+            nearest to controller.get_default_vector() in every
+            dimension, biasing (not fixing) early exploration toward
+            the hand-tuned baseline.
+        num_bins : int
+            Number of discrete levels each of the 27 dimensions is
+            sliced into. More bins = finer resolution but a bigger
+            table to learn (slower convergence for the same ant
+            budget).
+        alpha : float
+            Pheromone-influence exponent: selection probability for a
+            bin is proportional to tau ** alpha. alpha=1.0 is
+            standard Ant System; higher values make the colony more
+            greedily follow the strongest trails.
+        tau0 : float
+            Initial (and evaporation floor baseline) pheromone value
+            in every cell.
+        tau_min : float
+            Hard floor on pheromone after evaporation, so no bin ever
+            reaches exactly zero probability (keeps exploration
+            alive, as in Max-Min Ant System).
+        elitist_weight : float
+            Extra deposit multiplier applied to the global-best
+            solution's bins on every update, on top of its own
+            regular Q/cost deposit (elitist reinforcement, a common
+            Ant System refinement).
         """
-        if archive_size < 2:
-            raise ValueError("archive_size must be >= 2 (need at least 2 solutions "
-                              "to estimate per-dimension spread)")
-
         self.controller = controller
         self.fitness_fn = fitness_fn
 
-        self.archive_size = archive_size
+        self.init_batch = archive_size
         self.num_ants = num_ants
         self.max_iter = max_iter
-        self.q = q
-        self.xi = xi
+
+        # Re-purposed names -- see module docstring.
+        self.Q = max(q, 1e-6)
+        self.rho = float(np.clip(xi, 0.01, 0.99))
+
+        self.num_bins = num_bins
+        self.alpha = alpha
+        self.tau0 = tau0
+        self.tau_min = tau_min
+        self.elitist_weight = elitist_weight
 
         self.lower_bounds, self.upper_bounds = controller.get_param_bounds()
         self.dim = self.lower_bounds.shape[0]
@@ -162,22 +235,48 @@ class ACOOptimizer:
         self.rng = np.random.default_rng(random_seed)
         self.seed_with_default_vector = seed_with_default_vector
 
-        # Archive is kept as two parallel arrays (positions, fitness)
-        # plus the fixed rank-based selection weights (constant for a
-        # given archive_size and q, so computed once).
-        self.archive_positions: Optional[np.ndarray] = None  # shape (archive_size, dim)
-        self.archive_fitness: Optional[np.ndarray] = None    # shape (archive_size,)
-        self.selection_weights = self._compute_selection_weights()
-        self.selection_probs = self.selection_weights / self.selection_weights.sum()
+        # Bin centers per dimension: bin_centers[d, b] is the decoded
+        # value used whenever dimension d's bin b is chosen.
+        span = (self.upper_bounds - self.lower_bounds)[:, None]
+        offsets = (np.arange(num_bins) + 0.5) / num_bins  # shape (num_bins,)
+        self.bin_centers = self.lower_bounds[:, None] + offsets[None, :] * span  # (dim, num_bins)
+
+        # The pheromone table itself -- this IS the "memory" that
+        # replaces ACO_R's archive. One real number per (dimension,
+        # bin) cell.
+        self.pheromone = np.full((self.dim, self.num_bins), self.tau0)
+
+        if self.seed_with_default_vector:
+            self._bias_toward_default_vector()
+
+        self.best_position: Optional[np.ndarray] = None
+        self.best_bin_indices: Optional[np.ndarray] = None
+        self.best_cost: float = np.inf
+
+    # ------------------------------------------------------------------
+    # Initial bias (optional)
+    # ------------------------------------------------------------------
+
+    def _bias_toward_default_vector(self, boost_factor: float = 5.0) -> None:
+        """Pre-boost the pheromone at the bin nearest to each dimension
+        of the hand-tuned default vector. This is a soft bias, not a
+        guarantee the default value is ever sampled -- consistent with
+        the discrete, probabilistic nature of ACO selection."""
+        default_vector = self.controller.get_default_vector()
+        for d in range(self.dim):
+            nearest_bin = int(np.argmin(np.abs(self.bin_centers[d] - default_vector[d])))
+            self.pheromone[d, nearest_bin] *= boost_factor
 
     # ------------------------------------------------------------------
     # Repair: bounds + valid-triangle constraint (identical strategy to pso.py)
     # ------------------------------------------------------------------
 
     def _repair(self, position: np.ndarray) -> np.ndarray:
-        """Clip to bounds, then sort each (a, b, c) triangle ascending
-        so a <= b <= c holds. Safe because a, b, c share identical
-        bounds within each triangle (see module docstring)."""
+        """Clip to bounds (a no-op in practice since bin centers are
+        already within bounds -- kept for safety/symmetry with
+        pso.py), then sort each (a, b, c) triangle ascending so
+        a <= b <= c holds. Safe because a, b, c share an identical bin
+        grid within each triangle (see module docstring)."""
         repaired = np.clip(position, self.lower_bounds, self.upper_bounds)
         for start in range(0, _TRIANGLE_BLOCK_END, _TRIANGLE_WIDTH):
             end = start + _TRIANGLE_WIDTH
@@ -196,100 +295,75 @@ class ACOOptimizer:
         return self.fitness_fn(self.controller)
 
     # ------------------------------------------------------------------
-    # Archive (the ACO_R "pheromone" structure)
-    # ------------------------------------------------------------------
-
-    def _compute_selection_weights(self) -> np.ndarray:
-        """
-        Gaussian weight per archive rank (rank 1 = best). Lower q
-        concentrates weight on top ranks; higher q flattens it. This
-        matches the standard ACO_R weighting:
-
-            w_l = 1 / (q * K * sqrt(2*pi)) * exp(-(l-1)^2 / (2*q^2*K^2))
-
-        where l is the 1-indexed rank and K is the archive size.
-        """
-        ranks = np.arange(1, self.archive_size + 1)
-        k = self.archive_size
-        weights = (1.0 / (self.q * k * np.sqrt(2 * np.pi))) * np.exp(
-            -((ranks - 1) ** 2) / (2 * (self.q ** 2) * (k ** 2))
-        )
-        return weights
-
-    def _initialize_archive(self) -> None:
-        """Build the initial archive: random feasible solutions
-        (optionally seeding one with the default vector), evaluated
-        and sorted best-first."""
-        positions = np.empty((self.archive_size, self.dim))
-
-        for i in range(self.archive_size):
-            if i == 0 and self.seed_with_default_vector:
-                positions[i] = self.controller.get_default_vector().copy()
-            else:
-                positions[i] = self.rng.uniform(self.lower_bounds, self.upper_bounds)
-            positions[i] = self._repair(positions[i])
-
-        fitness = np.array([self._evaluate(p) for p in positions])
-
-        self.archive_positions, self.archive_fitness = self._sort_by_fitness(positions, fitness)
-
-    @staticmethod
-    def _sort_by_fitness(positions: np.ndarray, fitness: np.ndarray):
-        """Sort (positions, fitness) ascending by fitness (best/lowest first)."""
-        order = np.argsort(fitness)
-        return positions[order], fitness[order]
-
-    # ------------------------------------------------------------------
-    # Solution construction (the "ant walk")
+    # Solution construction (the "ant walk" -- now a genuine discrete
+    # walk over the pheromone table, one bin choice per dimension)
     # ------------------------------------------------------------------
 
     def _construct_ant(self) -> Ant:
         """
-        Build one new candidate solution, one dimension at a time:
-        for each dimension, pick a guiding archive member (weighted by
-        rank) and sample a Gaussian centered on that member's value in
-        that dimension, with spread set by how dispersed the archive
-        already is along that dimension (scaled by xi).
+        Build one new candidate solution, one dimension at a time: for
+        each dimension, choose a bin via roulette-wheel selection
+        weighted by tau[dim, :] ** alpha (Dorigo's classic transition
+        rule, with no heuristic/visibility term since there is no
+        natural "distance" between bins here -- pheromone-only
+        selection). Decode the chosen bins to a real-valued vector via
+        bin_centers, then repair.
         """
-        new_position = np.empty(self.dim)
-        k = self.archive_size
+        bin_indices = np.empty(self.dim, dtype=int)
+        raw_position = np.empty(self.dim)
 
         for dim_idx in range(self.dim):
-            guide_idx = self.rng.choice(k, p=self.selection_probs)
-            mean = self.archive_positions[guide_idx, dim_idx]
+            weights = self.pheromone[dim_idx] ** self.alpha
+            probs = weights / weights.sum()
+            chosen_bin = self.rng.choice(self.num_bins, p=probs)
 
-            # Average distance from the guide to every other archive
-            # member along this dimension -- ACO_R's stand-in for
-            # "how much has the colony already agreed on this variable".
-            spread = np.sum(np.abs(self.archive_positions[:, dim_idx] - mean)) / (k - 1)
-            sigma = self.xi * spread
+            bin_indices[dim_idx] = chosen_bin
+            raw_position[dim_idx] = self.bin_centers[dim_idx, chosen_bin]
 
-            if sigma <= 0.0:
-                # Archive has fully converged in this dimension; sample
-                # tightly around the guide instead of collapsing to a
-                # zero-variance (i.e. always-identical) draw.
-                sigma = 1e-6
+        position = self._repair(raw_position)
+        fitness = self._evaluate(position)
+        return Ant(position=position, bin_indices=bin_indices, fitness=fitness)
 
-            new_position[dim_idx] = self.rng.normal(mean, sigma)
+    # ------------------------------------------------------------------
+    # Pheromone update: evaporation + deposit (the actual "ACO" part)
+    # ------------------------------------------------------------------
 
-        new_position = self._repair(new_position)
-        fitness = self._evaluate(new_position)
-        return Ant(position=new_position, fitness=fitness)
+    def _update_pheromone(self, ants: List[Ant]) -> None:
+        """
+        Classic Ant System pheromone update, applied once per batch
+        (both the initial priming batch and every subsequent
+        iteration):
 
-    def _update_archive(self, new_ants: List[Ant]) -> None:
-        """Merge newly constructed ants into the archive and keep only
-        the best `archive_size` solutions overall (elitist truncation
-        -- this is ACO_R's pheromone-update step)."""
-        combined_positions = np.vstack(
-            [self.archive_positions] + [ant.position for ant in new_ants]
-        )
-        combined_fitness = np.concatenate(
-            [self.archive_fitness] + [[ant.fitness] for ant in new_ants]
-        )
+          1. Evaporation: every cell decays by factor (1 - rho),
+             floored at tau_min so no bin's probability collapses to
+             exactly zero (Max-Min-style safeguard against premature
+             stagnation).
+          2. Deposit: each ant reinforces the bins it used by
+             Delta_tau = Q / cost -- better (lower-cost) solutions
+             deposit more pheromone, exactly Dorigo's original rule.
+          3. Elitist deposit: the best solution found so far gets an
+             extra reinforcement on top of its own regular deposit,
+             on every update (a common, well-established Ant System
+             refinement that keeps the best-known trail from being
+             evaporated away).
+        """
+        self.pheromone *= (1.0 - self.rho)
+        self.pheromone = np.maximum(self.pheromone, self.tau_min)
 
-        sorted_positions, sorted_fitness = self._sort_by_fitness(combined_positions, combined_fitness)
-        self.archive_positions = sorted_positions[: self.archive_size]
-        self.archive_fitness = sorted_fitness[: self.archive_size]
+        for ant in ants:
+            deposit = self.Q / (ant.fitness + _COST_EPS)
+            self.pheromone[np.arange(self.dim), ant.bin_indices] += deposit
+
+        if self.best_bin_indices is not None:
+            elite_deposit = self.elitist_weight * self.Q / (self.best_cost + _COST_EPS)
+            self.pheromone[np.arange(self.dim), self.best_bin_indices] += elite_deposit
+
+    def _update_global_best(self, ants: List[Ant]) -> None:
+        for ant in ants:
+            if ant.fitness < self.best_cost:
+                self.best_cost = ant.fitness
+                self.best_position = ant.position.copy()
+                self.best_bin_indices = ant.bin_indices.copy()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -297,27 +371,35 @@ class ACOOptimizer:
 
     def optimize(self) -> tuple[np.ndarray, float, List[float]]:
         """
-        Run the full ACO_R optimization loop.
+        Run the full discretized-ACO optimization loop.
 
         Returns
         -------
         best_position : np.ndarray
-            The best 27-parameter vector found (archive's rank-1 member).
+            The best 27-parameter vector found.
         best_cost : float
             Its cost (lower is better).
         history : list[float]
-            Best archive cost after each iteration, for convergence
-            plots. Monotonically non-increasing by construction
-            (elitist truncation never lets the best solution get worse).
+            Global-best cost after the initial priming batch and
+            after each subsequent iteration, for convergence plots.
+            Monotonically non-increasing by construction (global best
+            is tracked separately from the pheromone table, so
+            evaporation can never make it worse).
         """
-        self._initialize_archive()
-        history: List[float] = [float(self.archive_fitness[0])]
+        # Initial priming batch: with a freshly-uniform pheromone
+        # table, selection probabilities are uniform too, so this is
+        # equivalent to random sampling -- the discretized analogue of
+        # ACO_R's random archive initialization.
+        init_ants = [self._construct_ant() for _ in range(self.init_batch)]
+        self._update_global_best(init_ants)
+        self._update_pheromone(init_ants)
+
+        history: List[float] = [self.best_cost]
 
         for _ in range(self.max_iter):
-            new_ants = [self._construct_ant() for _ in range(self.num_ants)]
-            self._update_archive(new_ants)
-            history.append(float(self.archive_fitness[0]))
+            ants = [self._construct_ant() for _ in range(self.num_ants)]
+            self._update_global_best(ants)
+            self._update_pheromone(ants)
+            history.append(self.best_cost)
 
-        best_position = self.archive_positions[0].copy()
-        best_cost = float(self.archive_fitness[0])
-        return best_position, best_cost, history
+        return self.best_position, self.best_cost, history
