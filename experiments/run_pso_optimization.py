@@ -69,6 +69,9 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from fuzzy.fuzzy_controller import FuzzyController
 from simulation.traffic_env import TrafficEnv
@@ -77,6 +80,7 @@ from optimization.pso import PSOOptimizer, make_multi_scenario_fitness
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = PROJECT_ROOT / "results" / "logs"
+DEFAULT_PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
 
 # --- toggle between the quick smoke test and the full Phase 4 run ---
 QUICK_TEST = True
@@ -102,8 +106,8 @@ if QUICK_TEST:
     PSO_KWARGS = dict(
         num_particles=12, max_iter=15,
         w=0.7, w_min=0.4, c1=1.5, c2=1.5,
-        seed_with_default_vector=True,
-        random_seed=7,
+        seed_with_default_vector=False,
+        random_seed=4,
     )
 else:
     SCENARIOS = [
@@ -118,7 +122,7 @@ else:
     PSO_KWARGS = dict(
         num_particles=30, max_iter=100,
         w=0.7, w_min=0.4, c1=1.5, c2=1.5,
-        seed_with_default_vector=True,
+        seed_with_default_vector=False,
         random_seed=7,
     )
 
@@ -170,7 +174,7 @@ def vector_to_readable(controller: FuzzyController, vector: np.ndarray) -> dict:
 
 
 def save_final_vector(controller, best_position, best_cost, baseline_cost, history,
-                       out_dir: Path = DEFAULT_LOG_DIR) -> tuple[Path, Path]:
+                       out_dir: Path = DEFAULT_LOG_DIR, timestamp: str | None = None) -> tuple[Path, Path]:
     """
     Persist the tuned vector to disk in two forms:
       - a raw .npy array, for loading straight back into a controller
@@ -182,10 +186,13 @@ def save_final_vector(controller, best_position, best_cost, baseline_cost, histo
 
     Filenames are tagged quick/full (from QUICK_TEST) and timestamped,
     so a quick smoke-test run can never silently overwrite a real
-    tuning run's results.
+    tuning run's results. Pass the same `timestamp` used for
+    save_convergence_plot() so the two output files from one run share
+    a matching stem.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "quick" if QUICK_TEST else "full"
     stem = f"pso_best_vector_{mode}_{timestamp}"
 
@@ -216,6 +223,44 @@ def save_final_vector(controller, best_position, best_cost, baseline_cost, histo
     return npy_path, json_path
 
 
+def save_convergence_plot(history, baseline_cost, out_dir: Path = DEFAULT_PLOTS_DIR,
+                           timestamp: str | None = None) -> Path:
+    """
+    Plot best-cost-so-far per iteration against the baseline -- same
+    style as compare_optimizers.py's plot_convergence(), single-
+    algorithm version (that script overlays both PSO and ACO on one
+    figure; this one just has PSO, since run_aco_optimization.py saves
+    its own equivalent plot separately).
+
+    Saved under results/plots/, tagged quick/full and timestamped like
+    save_final_vector()'s files, so a smoke-test plot never overwrites
+    a real run's plot. Pass the same `timestamp` used for
+    save_final_vector() so the two files from one run share a
+    matching stem.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = "quick" if QUICK_TEST else "full"
+    out_path = out_dir / f"pso_convergence_{mode}_{timestamp}.png"
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(history, label=f"PSO (best={history[-1]:.3f})")
+    plt.axhline(baseline_cost, color="gray", linestyle="--",
+                label=f"Baseline ({baseline_cost:.3f})")
+    plt.xlabel("Iteration")
+    plt.ylabel("Best avg cost so far")
+    plt.title("PSO convergence")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    print(f"Saved convergence plot to {out_path}")
+    return out_path
+
+
 def report_per_scenario(controller, factories, labels):
     """Print the tuned controller's cost on each individual scenario,
     not just the aggregate -- so a low average can't hide one scenario
@@ -231,6 +276,10 @@ def main():
         print("QUICK_TEST mode is ON -- this is a fast pipeline smoke test, "
               "not a real tuning run. Set QUICK_TEST = False for the full "
               "Phase 4 configuration.\n")
+
+    # Shared across save_convergence_plot() and save_final_vector() so
+    # this run's plot and logged vector share a matching filename stem.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     env_factories, labels = build_env_factories()
     print(f"Optimizing against {len(env_factories)} scenario/seed combinations "
@@ -304,6 +353,8 @@ def main():
     assert monotonic, "history is not monotonically non-increasing (global best regressed)"
     print("Monotonic convergence OK (global best never regresses)")
 
+    save_convergence_plot(history, baseline_cost, timestamp=run_timestamp)
+
     # HARD guarantee check: with seed_with_default_vector=True, particle 0
     # starts at the baseline, so best_cost <= baseline_cost is provable,
     # not just expected. If this ever fails, something is wrong with the
@@ -343,7 +394,8 @@ def main():
     controller.set_params_from_vector(best_position)
     report_per_scenario(controller, env_factories, labels)
 
-    save_final_vector(controller, best_position, best_cost, baseline_cost, history)
+    save_final_vector(controller, best_position, best_cost, baseline_cost, history,
+                       timestamp=run_timestamp)
 
     print("\nAll checks passed. `best_position` is ready to be loaded as the")
     print("final tuned controller (controller.set_params_from_vector(best_position)).")
