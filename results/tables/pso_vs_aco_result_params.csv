@@ -1,0 +1,28 @@
+param_name,baseline,PSO,ACO
+mf_queue.Low.a,0.0,0.0,1.5
+mf_queue.Low.b,0.0,0.0,1.5
+mf_queue.Low.c,7.0,5.5885,17.5
+mf_queue.Medium.a,3.0,0.0,0.5
+mf_queue.Medium.b,10.0,7.4238,3.5
+mf_queue.Medium.c,17.0,18.4083,15.5
+mf_queue.High.a,13.0,16.7957,12.5
+mf_queue.High.b,20.0,20.0,14.5
+mf_queue.High.c,20.0,20.0,14.5
+mf_green.Short.a,5.0,5.0,6.0
+mf_green.Short.b,5.0,5.0,6.0
+mf_green.Short.c,25.0,15.0036,34.0
+mf_green.Medium.a,11.0,5.0,22.0
+mf_green.Medium.b,25.0,9.1123,34.0
+mf_green.Medium.c,39.0,36.1878,40.0
+mf_green.Long.a,25.0,23.9845,22.0
+mf_green.Long.b,45.0,43.585,26.0
+mf_green.Long.c,45.0,45.0,44.0
+rule_weights[0] (IF q1=Low AND q2=Low THEN green=Medium),1.0,0.9768,0.375
+rule_weights[1] (IF q1=Low AND q2=Medium THEN green=Short),1.0,0.9491,0.775
+rule_weights[2] (IF q1=Low AND q2=High THEN green=Short),1.0,0.9383,0.625
+rule_weights[3] (IF q1=Medium AND q2=Low THEN green=Long),1.0,0.998,0.225
+rule_weights[4] (IF q1=Medium AND q2=Medium THEN green=Medium),1.0,1.0,0.075
+rule_weights[5] (IF q1=Medium AND q2=High THEN green=Short),1.0,0.986,0.875
+rule_weights[6] (IF q1=High AND q2=Low THEN green=Long),1.0,1.0,0.375
+rule_weights[7] (IF q1=High AND q2=Medium THEN green=Long),1.0,0.9978,0.175
+rule_weights[8] (IF q1=High AND q2=High THEN green=Medium),1.0,1.0,0.125

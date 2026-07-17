@@ -1,0 +1,128 @@
+{
+  "timestamp": "20260717_153539",
+  "mode": "full",
+  "quick_test": false,
+  "best_cost": 72.58568628196389,
+  "baseline_cost": 73.68228706506942,
+  "improvement": 1.0966007831055293,
+  "improvement_pct": 1.4882827702363697,
+  "num_iterations_run": 100,
+  "aco_kwargs": {
+    "archive_size": 30,
+    "num_ants": 15,
+    "max_iter": 100,
+    "q": 0.3,
+    "xi": 0.85,
+    "num_bins": 20,
+    "alpha": 1.0,
+    "tau0": 1.0,
+    "tau_min": 0.001,
+    "elitist_weight": 2.0,
+    "seed_with_default_vector": true,
+    "random_seed": 7
+  },
+  "scenarios": [
+    [
+      "moderate symmetric",
+      0.3,
+      0.3
+    ],
+    [
+      "moderate asymmetric",
+      0.4,
+      0.2
+    ],
+    [
+      "heavy asymmetric",
+      0.6,
+      0.2
+    ],
+    [
+      "heavy symmetric",
+      0.5,
+      0.5
+    ]
+  ],
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "num_steps": 1000,
+  "best_position_raw": [
+    1.5,
+    1.5,
+    17.5,
+    0.5,
+    3.5,
+    15.5,
+    12.5,
+    14.5,
+    14.5,
+    6.0,
+    6.0,
+    34.0,
+    22.0,
+    34.0,
+    40.0,
+    22.0,
+    26.0,
+    44.0,
+    0.375,
+    0.775,
+    0.625,
+    0.225,
+    0.075,
+    0.875,
+    0.375,
+    0.175,
+    0.125
+  ],
+  "best_position_readable": {
+    "mf_queue": {
+      "Low": [
+        1.5,
+        1.5,
+        17.5
+      ],
+      "Medium": [
+        0.5,
+        3.5,
+        15.5
+      ],
+      "High": [
+        12.5,
+        14.5,
+        14.5
+      ]
+    },
+    "mf_green": {
+      "Short": [
+        6.0,
+        6.0,
+        34.0
+      ],
+      "Medium": [
+        22.0,
+        34.0,
+        40.0
+      ],
+      "Long": [
+        22.0,
+        26.0,
+        44.0
+      ]
+    },
+    "rule_weights": {
+      "R0: IF q1=Low AND q2=Low THEN green=Medium": 0.375,
+      "R1: IF q1=Low AND q2=Medium THEN green=Short": 0.775,
+      "R2: IF q1=Low AND q2=High THEN green=Short": 0.625,
+      "R3: IF q1=Medium AND q2=Low THEN green=Long": 0.225,
+      "R4: IF q1=Medium AND q2=Medium THEN green=Medium": 0.075,
+      "R5: IF q1=Medium AND q2=High THEN green=Short": 0.875,
+      "R6: IF q1=High AND q2=Low THEN green=Long": 0.375,
+      "R7: IF q1=High AND q2=Medium THEN green=Long": 0.175,
+      "R8: IF q1=High AND q2=High THEN green=Medium": 0.125
+    }
+  }
+}
