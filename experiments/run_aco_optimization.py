@@ -6,8 +6,9 @@ Final Phase 3 run script for the discretized Ant System ACO
 and how archive_size/q/xi were re-purposed from the old ACO_R version).
 
 Mirrors run_pso_optimization.py in setup (same scenarios, same seeds,
-same fitness function) so PSO and ACO results are directly comparable
-in Phase 4 -- neither algorithm gets an easier or different evaluation.
+same fitness function, same evaluation budget per QUICK_TEST/full
+mode) so PSO and ACO results are directly comparable in Phase 4 --
+neither algorithm gets an easier or different evaluation.
 
 IMPORTANT -- updated for the new aco.py internals:
 This version no longer calls `aco._initialize_archive()` or reads
@@ -23,13 +24,39 @@ iteration, since `optimize()` itself is a black box that only
 returns once at the very end.
 
 --------------------------------------------------------------------
+ACO AND THE BASELINE (seed_with_default_vector=True, but SOFT)
+--------------------------------------------------------------------
+Both ACO_KWARGS below set seed_with_default_vector=True, same as
+run_pso_optimization.py. Unlike PSO, this does NOT force the baseline
+vector into the ant population -- it only pre-boosts pheromone near
+the baseline's nearest bin in every dimension by a fixed factor
+(_bias_toward_default_vector, x5). Ant selection stays fully
+probabilistic (roulette-wheel over tau ** alpha), so:
+
+    ACO's best_cost is USUALLY <= baseline_cost with this bias on and
+    enough ants/iterations, but this is NOT a hard guarantee the way
+    it is for PSO.
+
+Two consequences, both handled below:
+  1. QUICK_TEST's budget was bumped (see below) specifically so this
+     soft bias has enough ants/iterations to actually pay off, rather
+     than a handful of unlucky draws never finding the primed region.
+  2. main() prints a WARNING (not an assertion) if ACO finishes worse
+     than baseline, since -- unlike PSO -- that outcome is possible
+     without indicating a bug, just bad luck or too small a budget.
+
+--------------------------------------------------------------------
 QUICK_TEST MODE (default: on)
 --------------------------------------------------------------------
 This script defaults to a small, fast smoke-test configuration --
-1 scenario, 1 seed, 200-step simulations, and a small swarm/archive/
+1 scenario, 1 seed, 200-step simulations, and a small archive/ant/
 iteration count -- so you can sanity-check that ACO runs end-to-end,
-respects bounds, produces valid triangles, and improves on baseline,
-in well under a minute instead of ~10 minutes.
+respects bounds, produces valid triangles, and (usually) improves on
+baseline, in well under a minute instead of ~10 minutes. The budget
+here (12-ant priming batch, 10 ants/iteration x 15 iterations = 162
+evaluations) matches run_pso_optimization.py's QUICK_TEST evaluation
+count so the two scripts' smoke tests are directly comparable, not
+just individually "fast."
 
 Set QUICK_TEST = False to restore the full Phase 4 configuration
 (4 scenarios x 3 seeds, 1000-step simulations, archive_size=30,
@@ -70,11 +97,12 @@ QUICK_TEST = True
 RUN_REPRODUCIBILITY_CHECK = False
 
 if QUICK_TEST:
-    # Small enough to finish in well under a minute. Not meant to
-    # produce a genuinely well-tuned controller -- just to verify the
-    # pipeline (bounds, triangle validity, monotonic convergence,
-    # reproducibility hook) works end-to-end before committing to the
-    # full run below.
+    # Small enough to finish in well under a minute, but bumped up from
+    # an earlier bare-minimum smoke-test budget so the soft baseline
+    # bias (see module docstring) has a realistic chance to pay off,
+    # not just prove the pipeline runs. Evaluation count (162) is kept
+    # close to PSO's QUICK_TEST budget (180) for a fair side-by-side
+    # smoke test.
     SCENARIOS = [
         ("moderate symmetric", 0.3, 0.3),
     ]
@@ -82,9 +110,9 @@ if QUICK_TEST:
     NUM_STEPS = 200
 
     ACO_KWARGS = dict(
-        archive_size=8,
-        num_ants=6,
-        max_iter=10,
+        archive_size=12,
+        num_ants=10,
+        max_iter=15,
         q=0.3,
         xi=0.85,
         num_bins=20,
@@ -275,6 +303,10 @@ def main():
 
     print(f"\nPriming pheromone table ({ACO_KWARGS['archive_size']} random ants, "
           f"{len(env_factories)} scenarios each = {init_sims} simulations)...")
+    if ACO_KWARGS.get("seed_with_default_vector"):
+        print("  seed_with_default_vector=True: pheromone pre-boosted near the "
+              "baseline vector's bins (a soft bias, not a guarantee -- ACO "
+              "selection stays probabilistic, unlike PSO's hard seeding).")
     t_start = time.time()
     init_ants = [aco._construct_ant() for _ in range(aco.init_batch)]
     aco._update_global_best(init_ants)
@@ -317,6 +349,24 @@ def main():
     monotonic = all(history[i] >= history[i + 1] - 1e-9 for i in range(len(history) - 1))
     assert monotonic, "history is not monotonically non-increasing (global best regressed)"
     print("Monotonic convergence OK (global best never regresses)")
+
+    # SOFT baseline check: unlike PSO, seed_with_default_vector=True
+    # for ACO only biases pheromone near the baseline -- it does NOT
+    # force the baseline vector into the ant population. So ending up
+    # worse than baseline is POSSIBLE here (unlucky draws, too small a
+    # budget) without indicating a bug the way it would for PSO. Warn,
+    # don't assert.
+    if ACO_KWARGS.get("seed_with_default_vector"):
+        if best_cost <= baseline_cost + 1e-9:
+            print("Baseline comparison OK: best_cost <= baseline_cost.")
+        else:
+            print(f"WARNING: ACO finished worse than baseline "
+                  f"(best={best_cost:.4f} > baseline={baseline_cost:.4f}). "
+                  f"This is possible (not a bug) since ACO's baseline bias is "
+                  f"soft, not a hard guarantee like PSO's -- but if this "
+                  f"happens consistently, try increasing num_ants/max_iter/"
+                  f"archive_size, or raising the bias boost_factor in "
+                  f"_bias_toward_default_vector (aco.py).")
 
     check_feasibility(best_position, lower, upper, "best_position")
     assert best_position.shape == (27,), "vector length must be 27"

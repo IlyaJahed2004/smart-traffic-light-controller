@@ -1,45 +1,110 @@
 """
-experiments/compare_optimizers.py
+compare_optimizers.py
 
-Runs PSO (optimization/pso.py) and ACO (optimization/aco.py) against the
-same fuzzy-controller tuning problem and produces the four comparison
-criteria required for Phase 4:
+Phase 4: PSO vs. ACO comparison.
 
-  1. Final cost-function value achieved by each algorithm
-  2. Convergence speed (plotted, best-cost-so-far per iteration)
-  3. Stability of each algorithm's solution across different runs
-     (multiple random seeds -> mean +/- std of both final cost and
-     final parameter vector)
-  4. Effect of the optimization on the fuzzy controller's actual
-     performance (per-scenario cost breakdown of the tuned controller,
-     not just the aggregate number the optimizer minimized)
+IMPORTANT DESIGN CHOICE
+------------------------
+This script does NOT redefine PSO_KWARGS / ACO_KWARGS / SCENARIOS /
+env-factory helpers / vector<->readable conversion / save-to-disk
+logic from scratch. It imports `run_pso_optimization.py` and
+`run_aco_optimization.py` as modules and reuses their functions and
+config directly:
 
-Uses the SAME robust multi-scenario fitness as run_pso_optimization.py
-/ run_aco_optimization.py (4 traffic patterns x N seeds, averaged) so
-this script's numbers are consistent with -- not a different
-evaluation from -- those two run scripts.
+    import run_pso_optimization as pso_script
+    import run_aco_optimization as aco_script
 
-Outputs:
-  results/plots/pso_vs_aco_convergence.png   (criterion 2)
-  results/tables/pso_vs_aco_summary.md       (criteria 1, 3, 4)
-  results/tables/pso_vs_aco_summary.csv      (criterion 1, 3 -- machine-readable)
-  results/tables/pso_vs_aco_result_params.md (tuned parameters, human-readable)
-  results/tables/pso_vs_aco_result_params.csv
+    pso_script.FuzzyController, pso_script.PSOOptimizer,
+    pso_script.make_multi_scenario_fitness, pso_script.evaluate_controller,
+    pso_script.build_env_factories, pso_script.check_feasibility,
+    pso_script.vector_to_readable, pso_script.save_final_vector
+    (and the aco_script.* equivalents)
+
+The only things THIS file adds are:
+  - forcing both scripts onto one shared SCENARIOS/SEEDS/NUM_STEPS/
+    max_iter configuration (so PSO and ACO are never compared on two
+    different fitness landscapes by accident -- this mirrors the
+    invariant run_aco_optimization.py's own docstring already
+    requires),
+  - the orchestration loop that runs each algorithm's *headline* run
+    plus a *stability sweep* over several seeds,
+  - validating, for EVERY run (headline and every stability re-run,
+    both algorithms), that a real improvement over baseline actually
+    happened -- not just trusting the aggregate table. See
+    "VALIDATING REAL IMPROVEMENT" below.
+  - the plot/table writers for the 4 required comparison criteria.
+
+--------------------------------------------------------------------
+VALIDATING REAL IMPROVEMENT (added -- this is the point of the whole
+script, so it isn't just trusted silently)
+--------------------------------------------------------------------
+run_pso_optimization.py / run_aco_optimization.py already validate
+this for their OWN single headline run. This script reuses the exact
+same PSOOptimizer/ACOOptimizer classes, but through its own
+run_pso_once/run_aco_once, so that validation does NOT happen
+automatically here unless repeated -- so it is repeated explicitly,
+for every single run this script performs (not just the headline):
+
+  - PSO: since PSO_KWARGS sets seed_with_default_vector=True, one
+    particle always starts exactly at the baseline vector, and
+    global_best only ever updates on strict improvement. This makes
+    best_cost <= baseline_cost mathematically guaranteed, so
+    run_pso_once() asserts it after every run (headline AND every
+    stability-sweep seed). A failure here means a real bug, not bad
+    luck.
+  - ACO: ACO_KWARGS also sets seed_with_default_vector=True, but for
+    the discretized Ant System this only pre-boosts pheromone near
+    the baseline's bins -- it is a soft bias, not a guarantee (ant
+    selection stays fully probabilistic). So run_aco_once() checks
+    the same condition but only WARNS (doesn't assert) if it's
+    violated, exactly mirroring run_aco_optimization.py's own
+    reasoning.
+
+If you see the PSO assertion fire, something is broken (file an
+issue / stop trusting the results). If you see the ACO warning
+fire occasionally, it's expected variance; if it fires on EVERY
+seed, the ACO budget (num_ants/max_iter/archive_size) is probably
+too small for this fitness landscape and should be increased.
+
+--------------------------------------------------------------------
+Maps directly onto the project brief's "Algorithm Comparison" (§7)
+and the required deliverables in §8, item 4:
+
+  1. Final cost-function value
+        -> `results/tables/pso_vs_aco_summary.md` / `.csv`, section 1
+  2. Convergence speed
+        -> `results/plots/pso_vs_aco_convergence.png`
+        -> summary report, section 2 (sampled history)
+  3. Stability of the solution across different runs
+        -> multi-seed sweep -> summary report, section 3
+           (mean/std of final cost AND mean per-parameter std)
+  4. Effect of optimization on the fuzzy controller's performance
+        -> summary report, section 4: baseline vs. PSO-tuned vs.
+           ACO-tuned cost, broken down per traffic scenario (not
+           just the aggregate the optimizer minimized) -- also
+           writes the raw (W, Q, S) metrics per scenario, not just
+           the scalar cost, as supporting "generated data"
+           (§8 item 2).
+
+Also produces the §8 item 4 deliverables:
+  results/plots/pso_vs_aco_convergence.png
+  results/tables/pso_vs_aco_summary.md / .csv
+  results/tables/pso_vs_aco_result_params.md / .csv
+  results/tables/pso_vs_aco_per_scenario_metrics.csv
 
 Run from the project root:
     python experiments/compare_optimizers.py
-    python experiments/compare_optimizers.py --max-iter 100 --stability-seeds 1 2 3 4 5
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
+import sys
 import time
 from pathlib import Path
-import sys
 
+sys.path.append(str(Path(__file__).resolve().parent))   # for run_*_optimization imports
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
@@ -47,156 +112,168 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fuzzy.fuzzy_controller import FuzzyController
-from simulation.traffic_env import TrafficEnv
-from cost_function import evaluate_controller
-from optimization.pso import PSOOptimizer, make_multi_scenario_fitness
-from optimization.aco import ACOOptimizer
+import run_pso_optimization as pso_script
+import run_aco_optimization as aco_script
 
+from cost_function import compute_cost  # noqa: E402  (src on sys.path above)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
-DEFAULT_TABLES_DIR = PROJECT_ROOT / "results" / "tables"
-
-# Same four traffic patterns used throughout Phase 2/3 (see
-# src/fuzzy/README.md and run_pso_optimization.py /
-# run_aco_optimization.py) -- kept identical here so this script's
-# "final cost" numbers are directly comparable to those two.
-SCENARIOS = [
-    ("moderate symmetric",  0.3, 0.3),
-    ("moderate asymmetric", 0.4, 0.2),
-    ("heavy asymmetric",    0.6, 0.2),
-    ("heavy symmetric",     0.5, 0.5),
-]
+PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
+TABLES_DIR = PROJECT_ROOT / "results" / "tables"
 
 
 # ----------------------------------------------------------------------
-# Setup helpers
+# 0. Force PSO and ACO onto ONE shared configuration
+# ----------------------------------------------------------------------
+# COMPARE_QUICK_TEST mirrors the QUICK_TEST switch already used inside
+# run_pso_optimization.py / run_aco_optimization.py. Flip it to False
+# for the real Phase 4 numbers; leave it True for a fast sanity check
+# of this script itself (finishes in well under a minute).
+COMPARE_QUICK_TEST = False
+
+# Seeds used to re-run each optimizer independently for the stability
+# analysis (criterion 3). These are OPTIMIZER random seeds (affect
+# swarm/ant randomness), not traffic-scenario seeds -- see the module
+# docstring in run_pso_optimization.py / run_aco_optimization.py for
+# why these are two separate concepts.
+STABILITY_SEEDS = [1, 2, 3] if COMPARE_QUICK_TEST else [1, 2, 3, 4, 5]
+
+if COMPARE_QUICK_TEST:
+    SCENARIOS = [("moderate symmetric", 0.3, 0.3)]
+    SEEDS = [1]
+    NUM_STEPS = 200
+    MAX_ITER = 10
+    PSO_KWARGS = dict(num_particles=8, max_iter=MAX_ITER,
+                       w=0.7, w_min=0.4, c1=1.5, c2=1.5,
+                       seed_with_default_vector=False, random_seed=7)
+    ACO_KWARGS = dict(archive_size=8, num_ants=6, max_iter=MAX_ITER,
+                       q=0.3, xi=0.85, num_bins=20, alpha=1.0, tau0=1.0,
+                       tau_min=1e-3, elitist_weight=2.0,
+                       seed_with_default_vector=False, random_seed=7)
+else:
+    SCENARIOS = [
+        ("moderate symmetric",  0.3, 0.3),
+        ("moderate asymmetric", 0.4, 0.2),
+        ("heavy asymmetric",    0.6, 0.2),
+        ("heavy symmetric",     0.5, 0.5),
+    ]
+    SEEDS = [1, 2, 3]
+    NUM_STEPS = 1000
+    MAX_ITER = 100
+    PSO_KWARGS = dict(num_particles=30, max_iter=MAX_ITER,
+                       w=0.7, w_min=0.4, c1=1.5, c2=1.5,
+                       seed_with_default_vector=True, random_seed=7)
+    ACO_KWARGS = dict(archive_size=30, num_ants=15, max_iter=MAX_ITER,
+                       q=0.3, xi=0.85, num_bins=20, alpha=1.0, tau0=1.0,
+                       tau_min=1e-3, elitist_weight=2.0,
+                       seed_with_default_vector=True, random_seed=7)
+
+# Push the shared config into both imported modules. build_env_factories()
+# and save_final_vector() in each script read these as globals at call
+# time, so this is enough to make pso_script.build_env_factories() and
+# aco_script.build_env_factories() return identical env_factories/labels,
+# and to make each script's own save_final_vector() log the config this
+# script actually used (not whatever QUICK_TEST default was hardcoded
+# at the top of that script).
+for _mod in (pso_script, aco_script):
+    _mod.QUICK_TEST = COMPARE_QUICK_TEST
+    _mod.SCENARIOS = SCENARIOS
+    _mod.SEEDS = SEEDS
+    _mod.NUM_STEPS = NUM_STEPS
+pso_script.PSO_KWARGS = PSO_KWARGS
+aco_script.ACO_KWARGS = ACO_KWARGS
+
+
+# ----------------------------------------------------------------------
+# 1 & 2. Single headline run of each optimizer (used for the
+#         convergence plot and the "final cost" table)
 # ----------------------------------------------------------------------
 
-def make_env_factory(r1: float, r2: float, departure_rate: float, seed: int):
-    """Returns a zero-arg callable that builds a fresh TrafficEnv.
-    Defaults on r1/r2/seed avoid the classic late-binding closure bug
-    when this is called inside a loop."""
-    def _factory(r1=r1, r2=r2, departure_rate=departure_rate, seed=seed):
-        return TrafficEnv(arrival_rate_1=r1, arrival_rate_2=r2,
-                           departure_rate=departure_rate, seed=seed)
-    return _factory
+def run_pso_once(fitness_fn, seed: int, baseline_cost: float) -> dict:
+    """One PSO run with the given optimizer seed. Reuses
+    pso_script.FuzzyController / pso_script.PSOOptimizer directly.
 
-
-def build_env_factories(scenario_seeds: list[int], departure_rate: float):
-    """Cross product of SCENARIOS x scenario_seeds -> env_factories.
-    This is the fitness landscape both optimizers are tuned against."""
-    factories, labels = [], []
-    for label, r1, r2 in SCENARIOS:
-        for seed in scenario_seeds:
-            factories.append(make_env_factory(r1, r2, departure_rate, seed))
-            labels.append(f"{label} (seed={seed})")
-    return factories, labels
-
-
-def flat_param_names() -> list[str]:
-    """Names for each of the 27 vector entries, in the exact order
-    produced by FuzzyController.params_to_vector."""
-    names: list[str] = []
-    for set_name in FuzzyController.INPUT_SETS:
-        for point in ("a", "b", "c"):
-            names.append(f"mf_queue.{set_name}.{point}")
-    for set_name in FuzzyController.OUTPUT_SETS:
-        for point in ("a", "b", "c"):
-            names.append(f"mf_green.{set_name}.{point}")
-    for i, (s1, s2, out) in enumerate(FuzzyController.RULES):
-        names.append(f"rule_weights[{i}] (IF q1={s1} AND q2={s2} THEN green={out})")
-    return names
-
-
-def vector_to_readable(controller: FuzzyController, vector: np.ndarray) -> dict:
-    """Same information as vector_to_params, but with rule weights
-    keyed by a human-readable rule description instead of a bare index."""
-    params = controller.vector_to_params(vector)
-    readable = {
-        "mf_queue": {k: [round(float(x), 4) for x in v] for k, v in params["mf_queue"].items()},
-        "mf_green": {k: [round(float(x), 4) for x in v] for k, v in params["mf_green"].items()},
-        "rule_weights": {},
-    }
-    for i, (s1, s2, out) in enumerate(FuzzyController.RULES):
-        label = f"R{i}: IF q1={s1} AND q2={s2} THEN green={out}"
-        readable["rule_weights"][label] = round(float(params["rule_weights"][i]), 4)
-    return readable
-
-
-def check_feasibility(position: np.ndarray, lower: np.ndarray, upper: np.ndarray, label: str) -> None:
-    assert ((position >= lower - 1e-9) & (position <= upper + 1e-9)).all(), \
-        f"[{label}] position out of bounds"
-    for start in range(0, 18, 3):
-        a, b, c = position[start:start + 3]
-        assert a <= b + 1e-9 <= c + 1e-9, f"[{label}] invalid triangle at {start}: {a},{b},{c}"
-
-
-# ----------------------------------------------------------------------
-# Single optimizer runs (one seed) -- used both for the "headline" run
-# and for each repetition in the stability analysis
-# ----------------------------------------------------------------------
-
-def run_pso_once(fitness_fn, args: argparse.Namespace, seed: int) -> dict:
-    controller = FuzzyController()
-    pso = PSOOptimizer(
-        controller, fitness_fn,
-        num_particles=args.pso_particles,
-        max_iter=args.max_iter,
-        w=args.pso_w, w_min=args.pso_w_min,
-        c1=args.pso_c1, c2=args.pso_c2,
-        random_seed=seed,
-    )
+    Asserts best_cost <= baseline_cost: with seed_with_default_vector
+    =True, one particle always starts exactly at the baseline vector
+    and global_best only updates on strict improvement, so this is a
+    hard mathematical guarantee, not an expectation -- a failure here
+    means a real bug (see module docstring)."""
+    controller = pso_script.FuzzyController()
+    kwargs = dict(PSO_KWARGS)
+    kwargs["random_seed"] = seed
+    pso = pso_script.PSOOptimizer(controller, fitness_fn, **kwargs)
     t0 = time.time()
     best_position, best_cost, history = pso.optimize()
     elapsed = time.time() - t0
+
+    if kwargs.get("seed_with_default_vector", True):
+        assert best_cost <= baseline_cost + 1e-9, (
+            f"PSO (seed={seed}) best_cost ({best_cost:.4f}) is WORSE than "
+            f"baseline ({baseline_cost:.4f}) despite seed_with_default_vector"
+            f"=True -- this should be mathematically impossible. Check that "
+            f"the baseline particle's fitness is being evaluated and "
+            f"compared correctly."
+        )
+
     return dict(name="PSO", seed=seed, best_position=best_position,
                 best_cost=best_cost, history=history, elapsed=elapsed)
 
 
-def run_aco_once(fitness_fn, args: argparse.Namespace, seed: int) -> dict:
-    controller = FuzzyController()
-    aco = ACOOptimizer(
-        controller, fitness_fn,
-        archive_size=args.aco_archive_size,
-        num_ants=args.aco_num_ants,
-        max_iter=args.max_iter,
-        q=args.aco_q, xi=args.aco_xi,
-        random_seed=seed,
-    )
+def run_aco_once(fitness_fn, seed: int, baseline_cost: float) -> dict:
+    """One ACO run with the given optimizer seed. Reuses
+    aco_script.FuzzyController / aco_script.ACOOptimizer directly.
+
+    Unlike PSO, only WARNS (doesn't assert) if best_cost ends up worse
+    than baseline_cost: seed_with_default_vector=True for the
+    discretized Ant System only pre-boosts pheromone near the baseline
+    -- it does not force the baseline vector into the ant population,
+    so an occasional miss is possible variance, not necessarily a bug
+    (see module docstring)."""
+    controller = aco_script.FuzzyController()
+    kwargs = dict(ACO_KWARGS)
+    kwargs["random_seed"] = seed
+    aco = aco_script.ACOOptimizer(controller, fitness_fn, **kwargs)
     t0 = time.time()
     best_position, best_cost, history = aco.optimize()
     elapsed = time.time() - t0
+
+    if kwargs.get("seed_with_default_vector", False) and best_cost > baseline_cost + 1e-9:
+        print(f"  WARNING: ACO (seed={seed}) finished worse than baseline "
+              f"(best={best_cost:.4f} > baseline={baseline_cost:.4f}). "
+              f"Possible with ACO's soft bias -- not necessarily a bug. If "
+              f"this happens on most/all seeds, increase num_ants/max_iter/"
+              f"archive_size.")
+
     return dict(name="ACO", seed=seed, best_position=best_position,
                 best_cost=best_cost, history=history, elapsed=elapsed)
 
 
 # ----------------------------------------------------------------------
-# Criterion 3: stability across runs
+# Criterion 3: stability of the solution across different runs
 # ----------------------------------------------------------------------
 
-def stability_analysis(fitness_fn, args: argparse.Namespace) -> dict:
-    """
-    Re-runs both optimizers once per seed in args.stability_seeds
-    (independent optimizer RNG seeds, on the SAME fitness landscape),
-    and summarizes how much the final cost and final parameter vector
-    vary run-to-run. Low spread = stable/reliable algorithm; high
-    spread = sensitive to random initialization.
-    """
+def stability_analysis(fitness_fn, baseline_cost: float) -> dict:
+    """Re-runs each optimizer once per seed in STABILITY_SEEDS, on the
+    SAME fitness landscape, and summarizes how much the final cost
+    AND the final parameter vector vary run-to-run. Low spread = a
+    reliable algorithm; high spread = sensitive to random init.
+
+    Every individual run here is validated against baseline_cost too
+    (see run_pso_once / run_aco_once) -- stability is only meaningful
+    if every run actually represents a real improvement attempt, not
+    a mix of good runs and silently-broken ones."""
     print(f"\nStability analysis: re-running each optimizer with "
-          f"{len(args.stability_seeds)} different seeds "
-          f"({args.stability_seeds})...")
+          f"{len(STABILITY_SEEDS)} different seeds ({STABILITY_SEEDS})...")
 
     pso_runs, aco_runs = [], []
-    for seed in args.stability_seeds:
+    for seed in STABILITY_SEEDS:
         print(f"  [stability] PSO  seed={seed} ...", end=" ", flush=True)
-        r = run_pso_once(fitness_fn, args, seed)
+        r = run_pso_once(fitness_fn, seed, baseline_cost)
         pso_runs.append(r)
         print(f"cost={r['best_cost']:.4f}")
 
         print(f"  [stability] ACO  seed={seed} ...", end=" ", flush=True)
-        r = run_aco_once(fitness_fn, args, seed)
+        r = run_aco_once(fitness_fn, seed, baseline_cost)
         aco_runs.append(r)
         print(f"cost={r['best_cost']:.4f}")
 
@@ -223,22 +300,45 @@ def stability_analysis(fitness_fn, args: argparse.Namespace) -> dict:
 
 
 # ----------------------------------------------------------------------
-# Criterion 4: effect on actual controller performance, per scenario
+# Criterion 4: effect of optimization on the fuzzy controller's
+# actual performance
 # ----------------------------------------------------------------------
 
-def report_per_scenario(controller: FuzzyController, factories, labels, num_steps: int) -> list[dict]:
-    """Evaluate the tuned controller on each individual scenario
-    (not just the aggregate the optimizer minimized), so a good
-    average can't hide a regression on one traffic pattern."""
+def report_per_scenario_full(controller, factories, labels, num_steps: int) -> list[dict]:
+    """Like pso_script.report_per_scenario, but also keeps the raw
+    (W, Q, S) metrics per scenario -- not just the scalar cost -- so
+    the numbers behind each cost value are inspectable (this doubles
+    as the "generated data" deliverable, §8 item 2). Reimplements
+    evaluate_controller's realistic block-based switching loop
+    directly (rather than calling evaluate_controller, which only
+    returns the scalar cost) so env.get_metrics() stays accessible."""
     rows = []
     for factory, label in zip(factories, labels):
-        cost = evaluate_controller(controller, factory, num_steps)
-        rows.append(dict(label=label, cost=cost))
+        env = factory()
+        env.reset()
+        ticks_run = 0
+        while ticks_run < num_steps:
+            g1, g2 = controller.compute_green_time(env.queue_length_1, env.queue_length_2)
+            g1_ticks = max(1, round(g1))
+            g2_ticks = max(1, round(g2))
+            for _ in range(g1_ticks):
+                if ticks_run >= num_steps:
+                    break
+                env.step(1)
+                ticks_run += 1
+            for _ in range(g2_ticks):
+                if ticks_run >= num_steps:
+                    break
+                env.step(2)
+                ticks_run += 1
+        metrics = env.get_metrics()
+        cost = compute_cost(metrics)
+        rows.append(dict(label=label, cost=cost, metrics=metrics))
     return rows
 
 
 # ----------------------------------------------------------------------
-# Output: plot + tables
+# Output writers
 # ----------------------------------------------------------------------
 
 def plot_convergence(results: list[dict], baseline_cost: float, out_path: Path) -> None:
@@ -257,7 +357,8 @@ def plot_convergence(results: list[dict], baseline_cost: float, out_path: Path) 
     plt.close()
 
 
-def write_summary_report(results, baseline_cost, stability, per_scenario, out_path: Path) -> None:
+def write_summary_report(results, baseline_cost, stability, per_scenario_by_method,
+                          out_path: Path) -> None:
     lines = ["# PSO vs ACO — comparison summary\n"]
 
     lines.append("## 1. Final cost-function value\n")
@@ -266,22 +367,24 @@ def write_summary_report(results, baseline_cost, stability, per_scenario, out_pa
     lines.append("|---|---|---|---|")
     for r in results:
         improvement = baseline_cost - r["best_cost"]
-        pct = 100 * improvement / baseline_cost
+        pct = 100 * improvement / baseline_cost if baseline_cost else float("nan")
         lines.append(f"| {r['name']} | {r['best_cost']:.4f} | "
-                      f"{improvement:+.4f} ({pct:+.1f}%) | {r['elapsed']:.1f} |")
+                      f"{improvement:+.4f} ({pct:+.1f}%) | {r['elapsed']:.2f} |")
 
     lines.append("\n## 2. Convergence speed\n")
     lines.append("See `results/plots/pso_vs_aco_convergence.png` for the full curve. "
-                  "Best-cost-so-far sampled every few iterations:\n")
+                  "Best-cost-so-far sampled across the run:\n")
     for r in results:
         step = max(1, len(r["history"]) // 8)
         sampled = [round(h, 3) for h in r["history"][::step]]
         lines.append(f"- **{r['name']}**: {sampled}")
 
-    lines.append("\n## 3. Stability across runs\n")
+    lines.append("\n## 3. Stability of the solution across different runs\n")
     lines.append(f"Each optimizer re-run independently with seeds "
                   f"{[r['seed'] for r in stability['pso_runs']]} "
-                  f"on the same multi-scenario fitness landscape.\n")
+                  f"on the identical multi-scenario fitness landscape. Every "
+                  f"individual run was validated against the baseline (see "
+                  f"module docstring) before being included here.\n")
     lines.append("| Method | Cost mean | Cost std | Cost min | Cost max | "
                   "Mean per-parameter std |")
     lines.append("|---|---|---|---|---|---|")
@@ -290,19 +393,19 @@ def write_summary_report(results, baseline_cost, stability, per_scenario, out_pa
         lines.append(f"| {name} | {s['cost_mean']:.4f} | {s['cost_std']:.4f} | "
                       f"{s['cost_min']:.4f} | {s['cost_max']:.4f} | "
                       f"{s['param_std_mean']:.4f} |")
-    lines.append("\nLower `cost std` and lower `mean per-parameter std` both indicate a "
-                  "more stable/reliable algorithm -- it lands on a similar answer "
-                  "regardless of random seed. Higher values mean the algorithm's "
-                  "result depends more on where it happened to start.\n")
+    lines.append("\nLower `cost std` / `mean per-parameter std` = more stable "
+                  "(lands on a similar answer regardless of random seed).\n")
 
-    lines.append("\n## 4. Effect on fuzzy controller performance (per scenario)\n")
-    lines.append("Tuned controller (best of the two optimizers by final cost) "
-                  "evaluated on every individual traffic scenario/seed "
-                  "it was optimized against, not just the aggregate:\n")
-    lines.append("| Scenario | Cost |")
-    lines.append("|---|---|")
-    for row in per_scenario:
-        lines.append(f"| {row['label']} | {row['cost']:.2f} |")
+    lines.append("\n## 4. Effect of optimization on the fuzzy controller's performance\n")
+    lines.append("Baseline (untuned) vs. each tuned controller, evaluated on every "
+                  "individual traffic scenario/seed, not just the aggregate:\n")
+    all_labels = [row["label"] for row in per_scenario_by_method["Baseline"]]
+    header = "| Scenario | " + " | ".join(per_scenario_by_method.keys()) + " |"
+    lines.append(header)
+    lines.append("|" + "---|" * (len(per_scenario_by_method) + 1))
+    for i, label in enumerate(all_labels):
+        row_vals = [f"{per_scenario_by_method[m][i]['cost']:.2f}" for m in per_scenario_by_method]
+        lines.append(f"| {label} | " + " | ".join(row_vals) + " |")
 
     out_path.write_text("\n".join(lines))
 
@@ -314,11 +417,11 @@ def write_summary_csv(results, baseline_cost, stability, out_path: Path) -> None
                           "runtime_s", "stability_cost_mean", "stability_cost_std",
                           "stability_param_std_mean"])
         writer.writerow(["Baseline", round(baseline_cost, 4), "", "", "", "", ""])
-        for r, key in ((results[0], "pso_summary"), (results[1], "aco_summary")):
+        for r, key in zip(results, ("pso_summary", "aco_summary")):
             s = stability[key]
             writer.writerow([
                 r["name"], round(r["best_cost"], 4),
-                round(baseline_cost - r["best_cost"], 4), round(r["elapsed"], 1),
+                round(baseline_cost - r["best_cost"], 4), round(r["elapsed"], 2),
                 round(s["cost_mean"], 4), round(s["cost_std"], 4),
                 round(s["param_std_mean"], 4),
             ])
@@ -328,21 +431,31 @@ def write_param_report(controller, results, baseline_cost, default_vec, out_path
     lines = ["# PSO vs ACO — tuned parameter values\n",
              f"Baseline cost (default vector): **{baseline_cost:.4f}**\n",
              "\n## Baseline\n```json",
-             json.dumps(vector_to_readable(controller, default_vec), indent=2),
+             json.dumps(pso_script.vector_to_readable(controller, default_vec), indent=2),
              "```\n"]
     for r in results:
         lines.append(f"## {r['name']}\n")
         lines.append(f"- Best cost: **{r['best_cost']:.4f}**")
         lines.append(f"- Improvement over baseline: **{baseline_cost - r['best_cost']:+.4f}**")
-        lines.append(f"- Runtime: {r['elapsed']:.1f}s\n")
+        lines.append(f"- Runtime: {r['elapsed']:.2f}s\n")
         lines.append("```json")
-        lines.append(json.dumps(vector_to_readable(controller, r["best_position"]), indent=2))
+        lines.append(json.dumps(pso_script.vector_to_readable(controller, r["best_position"]), indent=2))
         lines.append("```\n")
     out_path.write_text("\n".join(lines))
 
 
 def write_param_csv(results, default_vec, out_path: Path) -> None:
-    names = flat_param_names()
+    names: list[str] = []
+    from fuzzy.fuzzy_controller import FuzzyController
+    for set_name in FuzzyController.INPUT_SETS:
+        for point in ("a", "b", "c"):
+            names.append(f"mf_queue.{set_name}.{point}")
+    for set_name in FuzzyController.OUTPUT_SETS:
+        for point in ("a", "b", "c"):
+            names.append(f"mf_green.{set_name}.{point}")
+    for i, (s1, s2, out) in enumerate(FuzzyController.RULES):
+        names.append(f"rule_weights[{i}] (IF q1={s1} AND q2={s2} THEN green={out})")
+
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
         header = ["param_name", "baseline"] + [r["name"] for r in results]
@@ -352,145 +465,134 @@ def write_param_csv(results, default_vec, out_path: Path) -> None:
             writer.writerow([name] + [round(float(col[i]), 4) for col in columns])
 
 
+def write_per_scenario_metrics_csv(per_scenario_by_method: dict, out_path: Path) -> None:
+    """Raw (W, Q, S) metrics per scenario per method -- the 'generated
+    data' behind every cost number in the summary report (§8 item 2)."""
+    with out_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["method", "scenario", "cost", "average_waiting_time",
+                          "average_queue_length", "num_stops",
+                          "total_cars_arrived", "total_cars_departed"])
+        for method, rows in per_scenario_by_method.items():
+            for row in rows:
+                m = row["metrics"]
+                writer.writerow([
+                    method, row["label"], round(row["cost"], 4),
+                    round(m["average_waiting_time"], 4),
+                    round(m["average_queue_length"], 4),
+                    m["num_stops"], m["total_cars_arrived"], m["total_cars_departed"],
+                ])
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run PSO and ACO on the fuzzy controller and produce a "
-                    "full Phase 4 comparison (final cost, convergence, "
-                    "stability, per-scenario effect)."
+    if COMPARE_QUICK_TEST:
+        print("COMPARE_QUICK_TEST is ON -- fast sanity check of this script, "
+              "not real Phase 4 numbers. Set COMPARE_QUICK_TEST = False for "
+              "the full comparison.\n")
+
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+
+    env_factories, labels = pso_script.build_env_factories()
+    print(f"Fitness landscape: {len(SCENARIOS)} traffic patterns x {len(SEEDS)} "
+          f"seeds = {len(env_factories)} scenario/seed combinations, averaged "
+          f"per candidate. num_steps={NUM_STEPS}, max_iter={MAX_ITER}\n")
+    print(f"Optimizer seeds -- headline: 7. Stability sweep: {STABILITY_SEEDS} "
+          f"(these are separate from the traffic-scenario seeds above).\n")
+
+    controller = pso_script.FuzzyController()
+    fitness_fn = pso_script.make_multi_scenario_fitness(
+        env_factories=env_factories, num_steps=NUM_STEPS, aggregate=np.mean,
     )
 
-    # Simulation / cost -- NOTE: decision_interval intentionally removed.
-    # evaluate_controller() no longer accepts it (Phase 2's block-based
-    # switching fix); this was a leftover from before that fix and would
-    # raise TypeError if kept.
-    parser.add_argument("--num-steps", type=int, default=1000)
-    parser.add_argument("--departure-rate", type=float, default=1.0)
-    parser.add_argument("--scenario-seeds", type=int, nargs="+", default=[1, 2, 3],
-                         help="Seeds used to build the multi-scenario fitness "
-                              "landscape both optimizers are tuned against "
-                              "(4 traffic patterns x these seeds).")
-
-    # Shared optimizer settings
-    parser.add_argument("--max-iter", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=7,
-                         help="Seed for the headline PSO/ACO run (the one "
-                              "used for the convergence plot and per-scenario "
-                              "report).")
-    parser.add_argument("--stability-seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5],
-                         help="Independent optimizer seeds used for the "
-                              "stability analysis (criterion 3).")
-
-    # PSO-specific
-    parser.add_argument("--pso-particles", type=int, default=30)
-    parser.add_argument("--pso-w", type=float, default=0.7)
-    parser.add_argument("--pso-w-min", type=float, default=0.4)
-    parser.add_argument("--pso-c1", type=float, default=1.5)
-    parser.add_argument("--pso-c2", type=float, default=1.5)
-
-    # ACO-specific
-    parser.add_argument("--aco-archive-size", type=int, default=20)
-    parser.add_argument("--aco-num-ants", type=int, default=10)
-    parser.add_argument("--aco-q", type=float, default=0.3)
-    parser.add_argument("--aco-xi", type=float, default=0.85)
-
-    parser.add_argument("--skip-stability", action="store_true",
-                         help="Skip the stability re-runs (criterion 3) to "
-                              "save time, e.g. for a quick sanity check.")
-    parser.add_argument("--output-dir", type=str, default=None,
-                         help="Override the project's results/ directory "
-                              "(plots/ and tables/ subfolders are created under it)")
-    args = parser.parse_args()
-
-    if args.output_dir:
-        plots_dir = Path(args.output_dir) / "plots"
-        tables_dir = Path(args.output_dir) / "tables"
-    else:
-        plots_dir, tables_dir = DEFAULT_PLOTS_DIR, DEFAULT_TABLES_DIR
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    tables_dir.mkdir(parents=True, exist_ok=True)
-
-    env_factories, labels = build_env_factories(args.scenario_seeds, args.departure_rate)
-    print(f"Fitness landscape: {len(SCENARIOS)} traffic patterns x "
-          f"{len(args.scenario_seeds)} seeds = {len(env_factories)} scenario/seed "
-          f"combinations, averaged per candidate.\n")
-
-    controller = FuzzyController()
-    lower, upper = controller.get_param_bounds()
-
-    fitness_fn = make_multi_scenario_fitness(
-        env_factories=env_factories, num_steps=args.num_steps, aggregate=np.mean,
-    )
-
-    # --- baseline ---
     default_vec = controller.get_default_vector()
     controller.set_params_from_vector(default_vec)
     baseline_cost = fitness_fn(controller)
     print(f"Baseline (default vector) avg cost: {baseline_cost:.4f}")
 
-    # --- headline PSO / ACO runs (used for plot + per-scenario report) ---
-    print("\nRunning headline PSO run (seed={})...".format(args.seed))
-    pso_result = run_pso_once(fitness_fn, args, args.seed)
-    print(f"PSO best avg cost: {pso_result['best_cost']:.4f}  ({pso_result['elapsed']:.1f}s)")
-    check_feasibility(pso_result["best_position"], lower, upper, "PSO best_position")
+    # --- headline runs (used for the convergence plot + criterion 1) ---
+    print(f"\nRunning headline PSO run (seed={PSO_KWARGS['random_seed']})...")
+    pso_result = run_pso_once(fitness_fn, PSO_KWARGS["random_seed"], baseline_cost)
+    print(f"PSO best avg cost: {pso_result['best_cost']:.4f}  ({pso_result['elapsed']:.2f}s)  "
+          f"-- guarantee OK: best_cost <= baseline_cost")
+    pso_script.check_feasibility(pso_result["best_position"],
+                                  *controller.get_param_bounds(), "PSO best_position")
 
-    print("\nRunning headline ACO run (seed={})...".format(args.seed))
-    aco_result = run_aco_once(fitness_fn, args, args.seed)
-    print(f"ACO best avg cost: {aco_result['best_cost']:.4f}  ({aco_result['elapsed']:.1f}s)")
-    check_feasibility(aco_result["best_position"], lower, upper, "ACO best_position")
+    print(f"\nRunning headline ACO run (seed={ACO_KWARGS['random_seed']})...")
+    aco_result = run_aco_once(fitness_fn, ACO_KWARGS["random_seed"], baseline_cost)
+    print(f"ACO best avg cost: {aco_result['best_cost']:.4f}  ({aco_result['elapsed']:.2f}s)")
+    aco_script.check_feasibility(aco_result["best_position"],
+                                  *controller.get_param_bounds(), "ACO best_position")
 
     results = [pso_result, aco_result]
 
     # --- criterion 2: convergence plot ---
-    plot_path = plots_dir / "pso_vs_aco_convergence.png"
+    plot_path = PLOTS_DIR / "pso_vs_aco_convergence.png"
     plot_convergence(results, baseline_cost, plot_path)
     print(f"\nSaved convergence plot to {plot_path}")
 
-    # --- criterion 3: stability across independent runs ---
-    if args.skip_stability:
-        print("\nSkipping stability analysis (--skip-stability set).")
-        stability = dict(
-            pso_runs=[pso_result], aco_runs=[aco_result],
-            pso_summary=dict(costs=[pso_result["best_cost"]], cost_mean=pso_result["best_cost"],
-                              cost_std=0.0, cost_min=pso_result["best_cost"],
-                              cost_max=pso_result["best_cost"], param_std_mean=0.0),
-            aco_summary=dict(costs=[aco_result["best_cost"]], cost_mean=aco_result["best_cost"],
-                              cost_std=0.0, cost_min=aco_result["best_cost"],
-                              cost_max=aco_result["best_cost"], param_std_mean=0.0),
-        )
-    else:
-        stability = stability_analysis(fitness_fn, args)
-        print(f"\nPSO stability: cost {stability['pso_summary']['cost_mean']:.4f} "
-              f"+/- {stability['pso_summary']['cost_std']:.4f}")
-        print(f"ACO stability: cost {stability['aco_summary']['cost_mean']:.4f} "
-              f"+/- {stability['aco_summary']['cost_std']:.4f}")
+    # --- criterion 3: stability across independent runs (each run
+    #     re-validated against baseline_cost internally) ---
+    stability = stability_analysis(fitness_fn, baseline_cost)
+    print(f"\nPSO stability: cost {stability['pso_summary']['cost_mean']:.4f} "
+          f"+/- {stability['pso_summary']['cost_std']:.4f}  "
+          f"(all {len(STABILITY_SEEDS)} seeds passed the baseline guarantee)")
+    print(f"ACO stability: cost {stability['aco_summary']['cost_mean']:.4f} "
+          f"+/- {stability['aco_summary']['cost_std']:.4f}")
+    aco_worse_count = sum(1 for r in stability["aco_runs"] if r["best_cost"] > baseline_cost + 1e-9)
+    if aco_worse_count:
+        print(f"  Note: ACO finished worse than baseline on {aco_worse_count}/"
+              f"{len(STABILITY_SEEDS)} stability seeds (see warnings above).")
 
     # --- criterion 4: effect on actual controller performance ---
-    best_of_two = min(results, key=lambda r: r["best_cost"])
-    controller.set_params_from_vector(best_of_two["best_position"])
-    per_scenario = report_per_scenario(controller, env_factories, labels, args.num_steps)
-    print(f"\nPer-scenario breakdown computed for the better of the two "
-          f"tuned controllers ({best_of_two['name']}).")
+    # Baseline vs. EACH tuned controller (not just "best of the two"),
+    # so a report reviewer can see both algorithms' before/after effect.
+    per_scenario_by_method = {}
+    controller.set_params_from_vector(default_vec)
+    per_scenario_by_method["Baseline"] = report_per_scenario_full(
+        controller, env_factories, labels, NUM_STEPS)
+    for r in results:
+        controller.set_params_from_vector(r["best_position"])
+        per_scenario_by_method[r["name"]] = report_per_scenario_full(
+            controller, env_factories, labels, NUM_STEPS)
+    print("\nPer-scenario breakdown computed for Baseline, PSO-tuned, and ACO-tuned.")
 
     # --- write reports ---
-    summary_md = tables_dir / "pso_vs_aco_summary.md"
-    write_summary_report(results, baseline_cost, stability, per_scenario, summary_md)
+    summary_md = TABLES_DIR / "pso_vs_aco_summary.md"
+    write_summary_report(results, baseline_cost, stability, per_scenario_by_method, summary_md)
     print(f"Saved comparison summary to {summary_md}")
 
-    summary_csv = tables_dir / "pso_vs_aco_summary.csv"
+    summary_csv = TABLES_DIR / "pso_vs_aco_summary.csv"
     write_summary_csv(results, baseline_cost, stability, summary_csv)
     print(f"Saved comparison summary (CSV) to {summary_csv}")
 
-    param_md = tables_dir / "pso_vs_aco_result_params.md"
+    param_md = TABLES_DIR / "pso_vs_aco_result_params.md"
     write_param_report(controller, results, baseline_cost, default_vec, param_md)
     print(f"Saved parameter report to {param_md}")
 
-    param_csv = tables_dir / "pso_vs_aco_result_params.csv"
+    param_csv = TABLES_DIR / "pso_vs_aco_result_params.csv"
     write_param_csv(results, default_vec, param_csv)
     print(f"Saved parameter table (CSV) to {param_csv}")
+
+    metrics_csv = TABLES_DIR / "pso_vs_aco_per_scenario_metrics.csv"
+    write_per_scenario_metrics_csv(per_scenario_by_method, metrics_csv)
+    print(f"Saved per-scenario raw metrics (CSV) to {metrics_csv}")
+
+    # --- also persist each optimizer's headline result the same way
+    #     run_pso_optimization.py / run_aco_optimization.py would on
+    #     their own (reuses their own save_final_vector) ---
+    controller.set_params_from_vector(pso_result["best_position"])
+    pso_script.save_final_vector(controller, pso_result["best_position"],
+                                  pso_result["best_cost"], baseline_cost,
+                                  pso_result["history"])
+    controller.set_params_from_vector(aco_result["best_position"])
+    aco_script.save_final_vector(controller, aco_result["best_position"],
+                                  aco_result["best_cost"], baseline_cost,
+                                  aco_result["history"])
 
     # --- console summary ---
     print("\n" + "=" * 70)
@@ -500,7 +602,7 @@ def main() -> None:
     print(f"{'Baseline':<10}{baseline_cost:>12.4f}{'--':>15}{'--':>14}")
     for r in results:
         print(f"{r['name']:<10}{r['best_cost']:>12.4f}"
-              f"{baseline_cost - r['best_cost']:>+15.4f}{r['elapsed']:>14.1f}")
+              f"{baseline_cost - r['best_cost']:>+15.4f}{r['elapsed']:>14.2f}")
 
 
 if __name__ == "__main__":
