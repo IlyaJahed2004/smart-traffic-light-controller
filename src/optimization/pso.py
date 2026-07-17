@@ -69,8 +69,6 @@ def make_single_scenario_fitness(
 ) -> FitnessFn:
     """
     Build a fitness function for the simple, single-scenario case
-    described in the README: one env_factory, evaluated once per
-    candidate.
 
     cost_kwargs are forwarded to evaluate_controller (alpha, beta,
     gamma only -- see cost_function.py). evaluate_controller now
