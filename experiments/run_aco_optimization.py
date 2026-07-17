@@ -125,7 +125,7 @@ if QUICK_TEST:
         tau_min=1e-3,
         elitist_weight=2.0,
         seed_with_default_vector=True,
-        random_seed=4,
+        random_seed=1,
     )
 else:
     # Full Phase 4 configuration -- identical to run_pso_optimization.py
@@ -159,7 +159,7 @@ else:
         # default vector's nearest bins -- a soft bias, not a guarantee the
         # default vector is ever actually sampled. Default for this class
         # is False; turned on here for rough parity with PSO's behavior.
-        seed_with_default_vector=True,
+        seed_with_default_vector=False,
         random_seed=7,
     )
 

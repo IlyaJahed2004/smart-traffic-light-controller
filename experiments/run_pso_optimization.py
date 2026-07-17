@@ -98,16 +98,17 @@ if QUICK_TEST:
     # THE BASELINE" section for why seed_with_default_vector=True
     # matters here.
     SCENARIOS = [
-        ("moderate symmetric", 0.3, 0.3),
+        # ("moderate symmetric", 0.3, 0.3),
+                ("moderate asymmetric", 0.4, 0.2),
     ]
     SEEDS = [1]
-    NUM_STEPS = 200
+    NUM_STEPS = 500
 
     PSO_KWARGS = dict(
         num_particles=12, max_iter=15,
         w=0.7, w_min=0.4, c1=1.5, c2=1.5,
         seed_with_default_vector=False,
-        random_seed=4,
+        random_seed=7,
     )
 else:
     SCENARIOS = [

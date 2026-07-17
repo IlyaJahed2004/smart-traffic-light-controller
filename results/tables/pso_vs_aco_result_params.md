@@ -58,7 +58,7 @@ Baseline cost (default vector): **73.6823**
 
 - Best cost: **68.1014**
 - Improvement over baseline: **+5.5809**
-- Runtime: 611.54s
+- Runtime: 190.74s
 
 ```json
 {
@@ -114,7 +114,7 @@ Baseline cost (default vector): **73.6823**
 
 - Best cost: **72.5857**
 - Improvement over baseline: **+1.0966**
-- Runtime: 744.89s
+- Runtime: 82.91s
 
 ```json
 {

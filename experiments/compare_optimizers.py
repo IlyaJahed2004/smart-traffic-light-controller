@@ -145,11 +145,11 @@ if COMPARE_QUICK_TEST:
     MAX_ITER = 10
     PSO_KWARGS = dict(num_particles=8, max_iter=MAX_ITER,
                        w=0.7, w_min=0.4, c1=1.5, c2=1.5,
-                       seed_with_default_vector=False, random_seed=7)
+                       seed_with_default_vector=True, random_seed=7)
     ACO_KWARGS = dict(archive_size=8, num_ants=6, max_iter=MAX_ITER,
                        q=0.3, xi=0.85, num_bins=20, alpha=1.0, tau0=1.0,
                        tau_min=1e-3, elitist_weight=2.0,
-                       seed_with_default_vector=False, random_seed=7)
+                       seed_with_default_vector=True, random_seed=7)
 else:
     SCENARIOS = [
         ("moderate symmetric",  0.3, 0.3),

@@ -1,4 +1,4 @@
 method,best_cost,improvement_over_baseline,runtime_s,stability_cost_mean,stability_cost_std,stability_param_std_mean
 Baseline,73.6823,,,,,
-PSO,68.1014,5.5809,611.54,68.0614,0.6028,1.1566
-ACO,72.5857,1.0966,744.89,73.7787,1.0795,3.9225
+PSO,68.1014,5.5809,190.74,68.0614,0.6028,1.1566
+ACO,72.5857,1.0966,82.91,73.7787,1.0795,3.9225

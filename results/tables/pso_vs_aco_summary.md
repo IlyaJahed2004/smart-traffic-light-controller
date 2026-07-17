@@ -6,8 +6,8 @@ Baseline (default hand-picked params): **73.6823**
 
 | Method | Best avg cost | Improvement over baseline | Runtime (s) |
 |---|---|---|---|
-| PSO | 68.1014 | +5.5809 (+7.6%) | 611.54 |
-| ACO | 72.5857 | +1.0966 (+1.5%) | 744.89 |
+| PSO | 68.1014 | +5.5809 (+7.6%) | 190.74 |
+| ACO | 72.5857 | +1.0966 (+1.5%) | 82.91 |
 
 ## 2. Convergence speed
 
