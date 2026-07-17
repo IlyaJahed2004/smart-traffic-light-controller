@@ -265,6 +265,7 @@ class PSOOptimizer:
         """
         repaired = np.clip(position, self.lower_bounds, self.upper_bounds)
 
+        # a ≤ b ≤ c
         for start in range(0, _TRIANGLE_BLOCK_END, _TRIANGLE_WIDTH):
             end = start + _TRIANGLE_WIDTH
             repaired[start:end] = np.sort(repaired[start:end])

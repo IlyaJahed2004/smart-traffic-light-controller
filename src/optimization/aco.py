@@ -140,18 +140,18 @@ class ACOOptimizer:
         self,
         controller,
         fitness_fn: FitnessFn,
-        archive_size: int = 20,
-        num_ants: int = 10,
+        archive_size: int = 20, # Initial ants number
+        num_ants: int = 10, # ants per iteration
         max_iter: int = 100,
-        q: float = 0.3,
-        xi: float = 0.85,
+        q: float = 0.3, # Pheromone deposit constant
+        xi: float = 0.85, # Evaporation rate
         random_seed: Optional[int] = None,
         seed_with_default_vector: bool = False,
-        num_bins: int = 20,
-        alpha: float = 1.0,
-        tau0: float = 1.0,
-        tau_min: float = 1e-3,
-        elitist_weight: float = 2.0,
+        num_bins: int = 20, # Number of discrete levels per dimension
+        alpha: float = 1.0, # Pheromone-influence exponent
+        tau0: float = 1.0, # Initial pheromone value
+        tau_min: float = 1e-3, # Minimum pheromone value after evaporation
+        elitist_weight: float = 2.0, # Extra deposit multiplier for the global-best solution
     ) -> None:
         """
         Parameters
@@ -268,7 +268,7 @@ class ACOOptimizer:
             self.pheromone[d, nearest_bin] *= boost_factor
 
     # ------------------------------------------------------------------
-    # Repair: bounds + valid-triangle constraint (identical strategy to pso.py)
+    # Repair: bounds + valid-triangle constraint
     # ------------------------------------------------------------------
 
     def _repair(self, position: np.ndarray) -> np.ndarray:
@@ -295,8 +295,7 @@ class ACOOptimizer:
         return self.fitness_fn(self.controller)
 
     # ------------------------------------------------------------------
-    # Solution construction (the "ant walk" -- now a genuine discrete
-    # walk over the pheromone table, one bin choice per dimension)
+    # Solution construction
     # ------------------------------------------------------------------
 
     def _construct_ant(self) -> Ant:
